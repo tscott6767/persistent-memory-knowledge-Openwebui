@@ -1,0 +1,1129 @@
+"""
+Persistent Memory Filter for OpenWebUI — family edition (v3)
+Single-file Filter with inlet (recall) + outlet (store).
+
+Extends v2 with:
+- External knowledge memory table (knowledge_items)
+- Source policy table (source_policies): prefer / unreliable / block
+- New commands:
+    knowledge add/list/forget/pin
+    source prefer/unreliable/block/remove/list
+- Combined context injection:
+    Contextual Notes...
+    Knowledge Notes...
+    Source Policy...
+"""
+
+import os
+import re
+import sqlite3
+import hashlib
+import logging
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+
+import numpy as np
+from numpy.linalg import norm
+
+# ───────────────────────────── Config ─────────────────────────────
+BASE_PATH = "/app/backend/data"
+DB_PATH = os.path.join(BASE_PATH, "memories.db")
+VAULT_DIR = os.path.join(BASE_PATH, "ObsidianVault/Memories")
+os.makedirs(VAULT_DIR, exist_ok=True)
+
+# bge-m3: multilingual, 8192-token context, 1024-dim
+EMBED_MODEL_NAME = "BAAI/bge-m3"
+EMBED_DIM = 1024
+
+# Recall tuning
+AUTO_RECALL_MIN_SIM = 0.55
+EXPLICIT_RECALL_MIN_SIM = 0.35
+KNOWLEDGE_AUTO_MIN_SIM = 0.50
+KNOWLEDGE_EXPLICIT_MIN_SIM = 0.30
+
+MAX_ITEMS = 3
+MAX_KNOWLEDGE_ITEMS = 4
+MAX_WORDS_PER_SUMMARY = 300
+MAX_WORDS_PER_KNOWLEDGE = 220
+RECALL_TOKEN_BUDGET = 1700
+RECENCY_HALFLIFE_DAYS = 30
+DEDUP_THRESHOLD = 0.92
+SEARCH_DEDUP_THRESHOLD = 0.93
+
+RECALL_BLOCK_MARKER = "Contextual Notes from previous discussion:"
+HOUSEHOLD_USER_ID = "household"
+GLOBAL_OWNER_ID = "global"
+
+# Auto-prune policy
+PRUNE_AGE_DAYS = 90
+PRUNE_MAX_USE_COUNT = 0  # never recalled
+
+SCHEMA_VERSION = 3
+
+# Per-user mute state (in-memory, resets on restart)
+_MUTED_USERS = set()
+
+logger = logging.getLogger("memory_filter")
+logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s %(message)s")
+
+# ───────────────────────── Lazy model loader ──────────────────────
+_EMB_MODEL = None
+
+
+def get_embedder():
+    global _EMB_MODEL
+    if _EMB_MODEL is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            _EMB_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
+            logger.info(f"Loaded embedding model {EMBED_MODEL_NAME}")
+        except Exception as e:
+            logger.error(f"Failed to load embedding model: {e}")
+            _EMB_MODEL = False
+    return _EMB_MODEL if _EMB_MODEL else None
+
+
+def embed(text: str):
+    m = get_embedder()
+    if m is None:
+        return None
+    v = m.encode(text, normalize_embeddings=False).astype(np.float32)
+    n = norm(v)
+    return v / n if n > 0 else v
+
+
+# ─────────────────────────── DB helpers ───────────────────────────
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def init_db():
+    with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER PRIMARY KEY
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memories (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                conversation_id TEXT,
+                user_msg TEXT,
+                assistant_msg TEXT,
+                summary TEXT,
+                embedding BLOB,
+                embedding_model TEXT,
+                embedding_dim INTEGER,
+                pinned INTEGER DEFAULT 0,
+                use_count INTEGER DEFAULT 0,
+                last_used_at DATETIME,
+                deleted_at DATETIME,
+                tags TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user ON memories(user_id)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_user_active ON memories(user_id, deleted_at)
+        """)
+
+        # v1/v2 compatibility: ensure tags exists
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()]
+        if "tags" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN tags TEXT")
+
+        # External knowledge table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS knowledge_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id TEXT NOT NULL,
+                scope TEXT NOT NULL DEFAULT 'user',   -- user | household | global
+                title TEXT,
+                content TEXT NOT NULL,
+                source_url TEXT,
+                source_domain TEXT,
+                confidence REAL DEFAULT 0.7,
+                tags TEXT,
+                embedding BLOB,
+                embedding_model TEXT,
+                embedding_dim INTEGER,
+                pinned INTEGER DEFAULT 0,
+                use_count INTEGER DEFAULT 0,
+                last_used_at DATETIME,
+                deleted_at DATETIME,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_knowledge_owner_active
+            ON knowledge_items(owner_user_id, deleted_at)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_knowledge_scope_active
+            ON knowledge_items(scope, deleted_at)
+        """)
+
+        # Source policy table
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS source_policies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                owner_user_id TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                policy TEXT NOT NULL,               -- prefer | unreliable | block
+                note TEXT,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(owner_user_id, domain)
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_source_owner_domain
+            ON source_policies(owner_user_id, domain)
+        """)
+
+        row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+        current = row[0] if row and row[0] is not None else 0
+        if current < SCHEMA_VERSION:
+            conn.execute(
+                "INSERT INTO schema_version(version) VALUES(?)", (SCHEMA_VERSION,)
+            )
+
+        conn.commit()
+
+
+init_db()
+
+
+# ─────────────────────────── Utilities ────────────────────────────
+def approx_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def truncate_to_budget(text: str, max_tokens: int) -> str:
+    if approx_tokens(text) <= max_tokens:
+        return text
+    char_budget = int(max_tokens * 4 * 0.9)
+    return text[:char_budget].rsplit(" ", 1)[0] + " … [truncated]"
+
+
+def truncate_words(text: str, max_words: int) -> str:
+    w = text.split()
+    if len(w) <= max_words:
+        return text
+    return " ".join(w[:max_words]) + " … [truncated]"
+
+
+def strip_recall_block(content: str) -> str:
+    # Defensive: if user content somehow includes injected recall text
+    if RECALL_BLOCK_MARKER in content:
+        # Try to keep only explicit "User's Current Question" tail if present
+        m = re.search(r"User's Current Question:\s*\n(.*)$", content, re.S)
+        if m:
+            return m.group(1).strip()
+    return content
+
+
+def recency_weight(timestamp_str: str) -> float:
+    try:
+        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - ts).total_seconds() / 86400
+        return 0.5 ** (age_days / RECENCY_HALFLIFE_DAYS)
+    except Exception:
+        return 1.0
+
+
+def get_user_id(__user__):
+    if not __user__ or "id" not in __user__:
+        return None
+    return __user__["id"]
+
+
+def get_conversation_id(body: dict) -> str:
+    return body.get("chat_id") or body.get("id") or "unknown"
+
+
+def normalize_domain(value: str) -> str:
+    if not value:
+        return ""
+    value = value.strip().lower()
+    if not value:
+        return ""
+    # If looks like URL, parse host
+    if "://" in value:
+        try:
+            host = urlparse(value).netloc.lower()
+        except Exception:
+            host = value
+    else:
+        host = value.split("/")[0].lower()
+
+    host = host.split("@")[-1]
+    host = host.split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host.strip(".")
+
+
+def parse_kv_pipe(text: str):
+    """
+    Parse:
+      "<main text> | key=value | key=value"
+    Returns: (main_text, dict)
+    """
+    parts = [p.strip() for p in text.split("|")]
+    if not parts:
+        return "", {}
+    main = parts[0]
+    kv = {}
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            kv[k.strip().lower()] = v.strip()
+    return main, kv
+
+
+def scope_to_owner(scope: str, user_id: str) -> str:
+    s = (scope or "user").strip().lower()
+    if s == "household":
+        return HOUSEHOLD_USER_ID
+    if s == "global":
+        return GLOBAL_OWNER_ID
+    return user_id
+
+
+# ─────────────────────────── Core search ──────────────────────────
+def search_memories(query: str, user_id: str, min_sim: float, top_k: int = MAX_ITEMS):
+    q_vec = embed(query)
+    if q_vec is None:
+        return []
+
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, summary, embedding, timestamp, pinned, user_id "
+            "FROM memories WHERE user_id IN (?, ?) AND deleted_at IS NULL "
+            "AND embedding_model=? AND embedding_dim=?",
+            (user_id, HOUSEHOLD_USER_ID, EMBED_MODEL_NAME, EMBED_DIM),
+        ).fetchall()
+
+    if not rows:
+        return []
+
+    scored = []
+    for mid, summary, blob, ts, pinned, owner in rows:
+        if not blob:
+            continue
+        try:
+            emb = np.frombuffer(blob, dtype=np.float32)
+            if emb.shape[0] != EMBED_DIM:
+                continue
+        except Exception:
+            continue
+
+        sim = float(np.dot(q_vec, emb))
+        weighted = sim * recency_weight(ts)
+        if pinned:
+            weighted += 0.15
+        if owner == HOUSEHOLD_USER_ID:
+            weighted += 0.05
+
+        if sim >= min_sim or pinned:
+            scored.append((weighted, sim, mid, summary, emb))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    selected, selected_ids = [], []
+    for weighted, sim, mid, summary, emb in scored:
+        if len(selected) >= top_k:
+            break
+        dup = False
+        for _, _, _, _, prev_emb in selected:
+            if float(np.dot(emb, prev_emb)) > SEARCH_DEDUP_THRESHOLD:
+                dup = True
+                break
+        if not dup:
+            selected.append((weighted, sim, mid, summary, emb))
+            selected_ids.append(mid)
+
+    if selected_ids:
+        try:
+            with db_connect() as conn:
+                conn.executemany(
+                    "UPDATE memories SET use_count=use_count+1, last_used_at=CURRENT_TIMESTAMP WHERE id=?",
+                    [(i,) for i in selected_ids],
+                )
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to update memory use stats: {e}")
+
+    return [(sim, summary) for _, sim, _, summary, _ in selected]
+
+
+def get_source_policy_map(user_id: str):
+    """
+    Returns domain -> policy merged from:
+      user overrides household overrides global
+    """
+    result = {}
+    rank = {GLOBAL_OWNER_ID: 1, HOUSEHOLD_USER_ID: 2, user_id: 3}
+    owners = (GLOBAL_OWNER_ID, HOUSEHOLD_USER_ID, user_id)
+
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT owner_user_id, domain, policy FROM source_policies "
+            "WHERE owner_user_id IN (?, ?, ?)",
+            owners,
+        ).fetchall()
+
+    # pick highest-owner-rank entry per domain
+    tmp = {}
+    for owner, domain, policy in rows:
+        d = normalize_domain(domain)
+        if not d:
+            continue
+        r = rank.get(owner, 0)
+        if d not in tmp or r > tmp[d][0]:
+            tmp[d] = (r, policy.strip().lower())
+
+    for d, (_, p) in tmp.items():
+        result[d] = p
+    return result
+
+
+def search_knowledge(query: str, user_id: str, min_sim: float, top_k: int = MAX_KNOWLEDGE_ITEMS):
+    q_vec = embed(query)
+    if q_vec is None:
+        return []
+
+    policy_map = get_source_policy_map(user_id)
+
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, title, content, source_domain, source_url, confidence, "
+            "embedding, timestamp, pinned, owner_user_id "
+            "FROM knowledge_items "
+            "WHERE owner_user_id IN (?, ?, ?) AND deleted_at IS NULL "
+            "AND embedding_model=? AND embedding_dim=?",
+            (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID, EMBED_MODEL_NAME, EMBED_DIM),
+        ).fetchall()
+
+    if not rows:
+        return []
+
+    scored = []
+    for kid, title, content, domain, source_url, confidence, blob, ts, pinned, owner in rows:
+        if not blob:
+            continue
+        try:
+            emb = np.frombuffer(blob, dtype=np.float32)
+            if emb.shape[0] != EMBED_DIM:
+                continue
+        except Exception:
+            continue
+
+        d = normalize_domain(domain or source_url or "")
+        pol = policy_map.get(d)
+
+        # hard block
+        if pol == "block":
+            continue
+
+        sim = float(np.dot(q_vec, emb))
+        weighted = sim * recency_weight(ts)
+
+        # quality bonuses/penalties
+        try:
+            conf = float(confidence) if confidence is not None else 0.7
+        except Exception:
+            conf = 0.7
+        conf = min(1.0, max(0.0, conf))
+        weighted += (conf - 0.5) * 0.12  # subtle confidence influence
+
+        if pinned:
+            weighted += 0.12
+        if owner == HOUSEHOLD_USER_ID:
+            weighted += 0.04
+        elif owner == GLOBAL_OWNER_ID:
+            weighted += 0.02
+
+        if pol == "prefer":
+            weighted += 0.08
+        elif pol == "unreliable":
+            weighted -= 0.08
+
+        if sim >= min_sim or pinned:
+            scored.append((weighted, sim, kid, title, content, d, conf, pol, emb))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    selected, selected_ids = [], []
+    for row in scored:
+        if len(selected) >= top_k:
+            break
+        emb = row[-1]
+        dup = False
+        for prev in selected:
+            prev_emb = prev[-1]
+            if float(np.dot(emb, prev_emb)) > SEARCH_DEDUP_THRESHOLD:
+                dup = True
+                break
+        if not dup:
+            selected.append(row)
+            selected_ids.append(row[2])
+
+    if selected_ids:
+        try:
+            with db_connect() as conn:
+                conn.executemany(
+                    "UPDATE knowledge_items SET use_count=use_count+1, last_used_at=CURRENT_TIMESTAMP WHERE id=?",
+                    [(i,) for i in selected_ids],
+                )
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to update knowledge use stats: {e}")
+
+    # return stripped form
+    out = []
+    for _, sim, kid, title, content, d, conf, pol, _ in selected:
+        out.append({
+            "sim": sim,
+            "id": kid,
+            "title": title or "",
+            "content": content or "",
+            "domain": d or "",
+            "confidence": conf,
+            "policy": pol or "normal",
+        })
+    return out
+
+
+def format_memory_recall(hits):
+    lines = []
+    for sim, summary in hits:
+        summary = truncate_words(summary, MAX_WORDS_PER_SUMMARY)
+        lines.append(f"(sim={round(sim,3)}) {summary}")
+    return "\n---\n".join(lines)
+
+
+def format_knowledge_recall(hits):
+    lines = []
+    for h in hits:
+        body = truncate_words(h["content"], MAX_WORDS_PER_KNOWLEDGE)
+        src = h["domain"] if h["domain"] else "unknown"
+        policy_tag = ""
+        if h["policy"] == "prefer":
+            policy_tag = " ✅preferred"
+        elif h["policy"] == "unreliable":
+            policy_tag = " ⚠️unreliable"
+        title = f"{h['title']} — " if h["title"] else ""
+        lines.append(
+            f"(sim={round(h['sim'],3)}, conf={round(h['confidence'],2)}) "
+            f"{title}{body} [source: {src}{policy_tag}]"
+        )
+    return "\n---\n".join(lines)
+
+
+def format_source_policy_summary(user_id: str):
+    owners = (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID)
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT owner_user_id, domain, policy FROM source_policies "
+            "WHERE owner_user_id IN (?, ?, ?) "
+            "ORDER BY owner_user_id, policy, domain",
+            owners,
+        ).fetchall()
+
+    if not rows:
+        return "No source policies set."
+
+    prefer, unreliable, block = [], [], []
+    for owner, domain, policy in rows:
+        d = normalize_domain(domain)
+        if not d:
+            continue
+        mark = "🏠 " if owner == HOUSEHOLD_USER_ID else ("🌐 " if owner == GLOBAL_OWNER_ID else "")
+        item = f"{mark}{d}"
+        p = policy.strip().lower()
+        if p == "prefer":
+            prefer.append(item)
+        elif p == "unreliable":
+            unreliable.append(item)
+        elif p == "block":
+            block.append(item)
+
+    parts = []
+    if prefer:
+        parts.append("Prefer: " + ", ".join(prefer[:20]))
+    if unreliable:
+        parts.append("Unreliable: " + ", ".join(unreliable[:20]))
+    if block:
+        parts.append("Blocked: " + ", ".join(block[:20]))
+    return " | ".join(parts) if parts else "No source policies set."
+
+
+def build_context_block(query: str, mem_hits, know_hits, source_policy_text: str):
+    sections = []
+
+    if mem_hits:
+        sections.append(f"{RECALL_BLOCK_MARKER}\n{format_memory_recall(mem_hits)}")
+    if know_hits:
+        sections.append(f"Knowledge Notes:\n{format_knowledge_recall(know_hits)}")
+    sections.append(f"Source Policy:\n{source_policy_text}")
+    sections.append(f"User's Current Question:\n{query}")
+
+    return truncate_to_budget("\n\n".join(sections), RECALL_TOKEN_BUDGET)
+
+
+# ───────────────────────── Command handlers ───────────────────────
+def cmd_list(user_id: str) -> str:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, substr(summary,1,120), pinned, timestamp, user_id "
+            "FROM memories WHERE user_id IN (?, ?) AND deleted_at IS NULL "
+            "ORDER BY id DESC LIMIT 20",
+            (user_id, HOUSEHOLD_USER_ID),
+        ).fetchall()
+    if not rows:
+        return "No memories stored."
+    return "\n".join(
+        f"[{mid}]{' 📌' if p else ''}{' 🏠' if owner == HOUSEHOLD_USER_ID else ''} {ts} — {snip}…"
+        for mid, snip, p, ts, owner in rows
+    )
+
+
+def cmd_forget(user_id: str, target: str) -> str:
+    try:
+        mid = int(target.strip())
+    except ValueError:
+        return "Usage: memory forget: <id>"
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE memories SET deleted_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND user_id IN (?, ?) AND deleted_at IS NULL",
+            (mid, user_id, HOUSEHOLD_USER_ID),
+        )
+        conn.commit()
+        return f"Forgotten {cur.rowcount} memory."
+
+
+def cmd_pin(user_id: str, text: str, household: bool = False) -> str:
+    text = text.strip()
+    if not text:
+        return "Usage: memory pin: <text> (or 'memory pin household: <text>')"
+    v = embed(text)
+    if v is None:
+        return "Embedding model unavailable."
+    owner = HOUSEHOLD_USER_ID if household else user_id
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO memories(user_id, summary, user_msg, assistant_msg, "
+            "embedding, embedding_model, embedding_dim, pinned) "
+            "VALUES (?,?,?,?,?,?,?,1)",
+            (owner, text, text, "", v.tobytes(), EMBED_MODEL_NAME, EMBED_DIM),
+        )
+        conn.commit()
+    label = "🏠 Household" if household else "📌 Pinned"
+    return f"{label}: {text[:80]}"
+
+
+def cmd_stats(user_id: str) -> str:
+    with db_connect() as conn:
+        personal = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(pinned),0), COALESCE(SUM(use_count),0) "
+            "FROM memories WHERE user_id=? AND deleted_at IS NULL",
+            (user_id,),
+        ).fetchone()
+        household = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE user_id=? AND deleted_at IS NULL",
+            (HOUSEHOLD_USER_ID,),
+        ).fetchone()
+        knowledge = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(pinned),0), COALESCE(SUM(use_count),0) "
+            "FROM knowledge_items WHERE owner_user_id IN (?, ?, ?) AND deleted_at IS NULL",
+            (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID),
+        ).fetchone()
+    return (
+        f"Memory — Personal: {personal[0]} total, {personal[1]} pinned, {personal[2]} recalls. "
+        f"Household: {household[0]}. "
+        f"Knowledge: {knowledge[0]} total, {knowledge[1]} pinned, {knowledge[2]} recalls."
+    )
+
+
+def cmd_mute(user_id: str, on: bool) -> str:
+    if on:
+        _MUTED_USERS.add(user_id)
+        return "🔇 Memory storage muted for this session."
+    _MUTED_USERS.discard(user_id)
+    return "🔊 Memory storage resumed."
+
+
+def cmd_prune(user_id: str) -> str:
+    with db_connect() as conn:
+        cur = conn.execute(
+            f"UPDATE memories SET deleted_at=CURRENT_TIMESTAMP "
+            f"WHERE user_id=? AND deleted_at IS NULL AND pinned=0 "
+            f"AND use_count<=? AND timestamp < datetime('now', '-{PRUNE_AGE_DAYS} days')",
+            (user_id, PRUNE_MAX_USE_COUNT),
+        )
+        conn.commit()
+        return f"Pruned {cur.rowcount} stale memories."
+
+
+def cmd_list_pinned(user_id: str) -> str:
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, substr(summary,1,120), timestamp, user_id "
+            "FROM memories "
+            "WHERE user_id IN (?, ?) AND deleted_at IS NULL AND pinned = 1 "
+            "ORDER BY id DESC LIMIT 20",
+            (user_id, HOUSEHOLD_USER_ID),
+        ).fetchall()
+    if not rows:
+        return "No pinned memories found."
+    return "\n".join(
+        f"[{mid}]{' 🏠' if owner == HOUSEHOLD_USER_ID else ''} {ts} — {snip}…"
+        for mid, snip, ts, owner in rows
+    )
+
+
+# ─────────────── knowledge_manager command handlers ───────────────
+def cmd_knowledge_add(user_id: str, payload: str) -> str:
+    """
+    knowledge add: <text> | source=<url/domain> | confidence=0.8 | scope=household | tags=a,b | title=...
+    """
+    content, kv = parse_kv_pipe(payload)
+    content = content.strip()
+    if not content:
+        return "Usage: knowledge add: <text> | source=<url/domain> | confidence=0.8 | scope=user|household|global | tags=a,b"
+
+    source = kv.get("source", "").strip()
+    source_domain = normalize_domain(source)
+    title = kv.get("title", "").strip() or None
+    tags = kv.get("tags", "").strip() or None
+
+    try:
+        confidence = float(kv.get("confidence", "0.7"))
+    except Exception:
+        confidence = 0.7
+    confidence = min(1.0, max(0.0, confidence))
+
+    scope = kv.get("scope", "user").strip().lower()
+    if scope not in {"user", "household", "global"}:
+        scope = "user"
+    owner = scope_to_owner(scope, user_id)
+
+    emb_text = f"{title or ''}\n{content}\nsource:{source_domain}"
+    v = embed(emb_text)
+    if v is None:
+        return "Embedding model unavailable."
+
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO knowledge_items("
+            "owner_user_id, scope, title, content, source_url, source_domain, confidence, tags, "
+            "embedding, embedding_model, embedding_dim"
+            ") VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                owner,
+                scope,
+                title,
+                content,
+                source if source else None,
+                source_domain if source_domain else None,
+                confidence,
+                tags,
+                v.tobytes(),
+                EMBED_MODEL_NAME,
+                EMBED_DIM,
+            ),
+        )
+        conn.commit()
+
+    owner_label = "🏠 household" if owner == HOUSEHOLD_USER_ID else ("🌐 global" if owner == GLOBAL_OWNER_ID else "personal")
+    src_label = source_domain if source_domain else "no-source"
+    return f"Saved knowledge ({owner_label}, conf={round(confidence,2)}, source={src_label})."
+
+
+def cmd_knowledge_list(user_id: str, query: str) -> str:
+    query = (query or "").strip()
+
+    if not query:
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT id, substr(content,1,120), source_domain, confidence, pinned, owner_user_id, timestamp "
+                "FROM knowledge_items "
+                "WHERE owner_user_id IN (?, ?, ?) AND deleted_at IS NULL "
+                "ORDER BY id DESC LIMIT 20",
+                (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID),
+            ).fetchall()
+        if not rows:
+            return "No knowledge items stored."
+        return "\n".join(
+            f"[{kid}]{' 📌' if p else ''}{' 🏠' if owner == HOUSEHOLD_USER_ID else (' 🌐' if owner == GLOBAL_OWNER_ID else '')} "
+            f"{ts} — conf={round(conf or 0.0,2)} src={dom or 'n/a'} — {snip}…"
+            for kid, snip, dom, conf, p, owner, ts in rows
+        )
+
+    hits = search_knowledge(query, user_id, min_sim=0.0, top_k=20)
+    if not hits:
+        return "No matching knowledge items."
+    lines = []
+    for h in hits:
+        scope_badge = ""
+        lines.append(
+            f"[{h['id']}] sim={round(h['sim'],3)} conf={round(h['confidence'],2)} "
+            f"src={h['domain'] or 'n/a'}{scope_badge} — {truncate_words(h['content'],40)}"
+        )
+    return "\n".join(lines)
+
+
+def cmd_knowledge_forget(user_id: str, target: str) -> str:
+    try:
+        kid = int(target.strip())
+    except ValueError:
+        return "Usage: knowledge forget: <id>"
+
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE knowledge_items SET deleted_at=CURRENT_TIMESTAMP "
+            "WHERE id=? AND owner_user_id IN (?, ?, ?) AND deleted_at IS NULL",
+            (kid, user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID),
+        )
+        conn.commit()
+    return f"Forgotten {cur.rowcount} knowledge item."
+
+
+def cmd_knowledge_pin(user_id: str, target: str) -> str:
+    try:
+        kid = int(target.strip())
+    except ValueError:
+        return "Usage: knowledge pin: <id>"
+
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE knowledge_items SET pinned=1 "
+            "WHERE id=? AND owner_user_id IN (?, ?, ?) AND deleted_at IS NULL",
+            (kid, user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID),
+        )
+        conn.commit()
+    return f"Pinned {cur.rowcount} knowledge item."
+
+
+# ─────────────── sources_manager command handlers ────────────────
+def upsert_source_policy(owner_user_id: str, domain: str, policy: str, note: str = None):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO source_policies(owner_user_id, domain, policy, note, updated_at) "
+            "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(owner_user_id, domain) DO UPDATE SET "
+            "policy=excluded.policy, note=excluded.note, updated_at=CURRENT_TIMESTAMP",
+            (owner_user_id, domain, policy, note),
+        )
+        conn.commit()
+
+
+def cmd_source_set(user_id: str, raw: str, policy: str) -> str:
+    # Allow optional scope hint: domain.com | scope=household
+    main, kv = parse_kv_pipe(raw)
+    domain = normalize_domain(main)
+    if not domain:
+        return f"Usage: source {policy}: <domain> | scope=user|household|global"
+    scope = kv.get("scope", "user").strip().lower()
+    if scope not in {"user", "household", "global"}:
+        scope = "user"
+    owner = scope_to_owner(scope, user_id)
+    note = kv.get("note")
+    upsert_source_policy(owner, domain, policy, note=note)
+    scope_lbl = "🏠 household" if owner == HOUSEHOLD_USER_ID else ("🌐 global" if owner == GLOBAL_OWNER_ID else "personal")
+    return f"Source policy set: {domain} → {policy} ({scope_lbl})."
+
+
+def cmd_source_remove(user_id: str, raw: str) -> str:
+    main, kv = parse_kv_pipe(raw)
+    domain = normalize_domain(main)
+    if not domain:
+        return "Usage: source remove: <domain> | scope=user|household|global"
+
+    scope = kv.get("scope", "user").strip().lower()
+    if scope not in {"user", "household", "global"}:
+        scope = "user"
+    owner = scope_to_owner(scope, user_id)
+
+    with db_connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM source_policies WHERE owner_user_id=? AND domain=?",
+            (owner, domain),
+        )
+        conn.commit()
+    return f"Removed {cur.rowcount} source policy for {domain}."
+
+
+def cmd_source_list(user_id: str) -> str:
+    owners = (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID)
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT owner_user_id, domain, policy, updated_at FROM source_policies "
+            "WHERE owner_user_id IN (?, ?, ?) "
+            "ORDER BY owner_user_id, policy, domain",
+            owners,
+        ).fetchall()
+
+    if not rows:
+        return "No source policies set."
+
+    lines = []
+    for owner, domain, policy, ts in rows:
+        badge = "🏠" if owner == HOUSEHOLD_USER_ID else ("🌐" if owner == GLOBAL_OWNER_ID else "👤")
+        lines.append(f"{badge} {normalize_domain(domain)} → {policy} ({ts})")
+    return "\n".join(lines)
+
+
+# ─────────────────────────── Filter class ─────────────────────────
+class Filter:
+    def __init__(self):
+        pass
+
+    # ----------------------------- inlet -----------------------------
+    def inlet(self, body: dict, __user__: dict = None):
+        try:
+            user_id = get_user_id(__user__)
+            if not user_id:
+                return body
+
+            messages = body.get("messages", [])
+            if not messages or messages[-1].get("role") != "user":
+                return body
+
+            last = messages[-1].get("content", "").strip()
+            low = last.lower()
+
+            # ----- memory commands -----
+            if low.startswith("memory list:"):
+                return self._reply_inline(body, cmd_list(user_id))
+            if low.startswith("memory stats:"):
+                return self._reply_inline(body, cmd_stats(user_id))
+            if low.startswith("memory forget:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_forget(user_id, arg))
+            if low.startswith("memory pin household:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_pin(user_id, arg, household=True))
+            if low.startswith("memory pin:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_pin(user_id, arg))
+            if low.startswith("memory mute:"):
+                return self._reply_inline(body, cmd_mute(user_id, True))
+            if low.startswith("memory unmute:"):
+                return self._reply_inline(body, cmd_mute(user_id, False))
+            if low.startswith("memory prune:"):
+                return self._reply_inline(body, cmd_prune(user_id))
+            if low.startswith("memory list pinned:"):
+                return self._reply_inline(body, cmd_list_pinned(user_id))
+
+            # ----- knowledge commands -----
+            if low.startswith("knowledge add:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_knowledge_add(user_id, arg))
+            if low.startswith("knowledge list:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_knowledge_list(user_id, arg))
+            if low.startswith("knowledge forget:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_knowledge_forget(user_id, arg))
+            if low.startswith("knowledge pin:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_knowledge_pin(user_id, arg))
+
+            # ----- source commands -----
+            if low.startswith("source prefer:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_source_set(user_id, arg, "prefer"))
+            if low.startswith("source unreliable:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_source_set(user_id, arg, "unreliable"))
+            if low.startswith("source block:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_source_set(user_id, arg, "block"))
+            if low.startswith("source remove:"):
+                arg = last.split(":", 1)[1]
+                return self._reply_inline(body, cmd_source_remove(user_id, arg))
+            if low.startswith("source list:") or low == "source list":
+                return self._reply_inline(body, cmd_source_list(user_id))
+
+            # ----- explicit recall -----
+            m = re.match(r"^recall\s*[:\-]\s*(.+)$", last, re.I | re.S)
+            if m:
+                query = m.group(1).strip()
+                mem_hits = search_memories(query, user_id, EXPLICIT_RECALL_MIN_SIM)
+                know_hits = search_knowledge(query, user_id, KNOWLEDGE_EXPLICIT_MIN_SIM)
+                src_txt = format_source_policy_summary(user_id)
+
+                if mem_hits or know_hits:
+                    block = build_context_block(query, mem_hits, know_hits, src_txt)
+                    self._inject_system(messages, block)
+                    messages[-1]["content"] = query
+                    logger.info(
+                        f"Explicit recall: mem={len(mem_hits)} knowledge={len(know_hits)} for {user_id}"
+                    )
+                return body
+
+            # ----- automatic background recall -----
+            query_text = re.sub(r"\s*--private\b", "", last).strip()
+            mem_hits = search_memories(query_text, user_id, AUTO_RECALL_MIN_SIM)
+            know_hits = search_knowledge(query_text, user_id, KNOWLEDGE_AUTO_MIN_SIM)
+            src_txt = format_source_policy_summary(user_id)
+
+            if mem_hits or know_hits:
+                block = build_context_block(query_text, mem_hits, know_hits, src_txt)
+                self._inject_system(messages, block)
+                logger.info(
+                    f"Auto recall: mem={len(mem_hits)} knowledge={len(know_hits)} for {user_id}"
+                )
+
+        except Exception as e:
+            logger.error(f"inlet error: {e}")
+        return body
+
+    @staticmethod
+    def _inject_system(messages: list, block: str):
+        sys_msg = {
+            "role": "system",
+            "content": block,
+        }
+        messages.insert(len(messages) - 1, sys_msg)
+
+    @staticmethod
+    def _reply_inline(body: dict, text: str):
+        messages = body.get("messages", [])
+        if messages and messages[-1].get("role") == "user":
+            messages[-1]["content"] = (
+                "Respond with exactly the following text and nothing else, "
+                "no preamble, no quoting, no commentary:\n\n"
+                f"{text}"
+            )
+        body["_memory_short_circuit"] = True
+        return body
+
+    # ----------------------------- outlet ----------------------------
+    def outlet(self, body: dict, __user__: dict = None):
+        try:
+            if body.get("_memory_short_circuit"):
+                return body
+
+            user_id = get_user_id(__user__)
+            if not user_id:
+                return body
+
+            if user_id in _MUTED_USERS:
+                return body
+
+            messages = body.get("messages", [])
+            if len(messages) < 2:
+                return body
+
+            asst = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
+            if not asst:
+                return body
+            asst_text = asst.get("content", "").strip()
+            if not asst_text:
+                return body
+
+            user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+            if not user:
+                return body
+
+            user_text_raw = strip_recall_block(user.get("content", "")).strip()
+            if not user_text_raw:
+                return body
+
+            # --private flag => do not store turn
+            if "--private" in user_text_raw.lower():
+                logger.info("Skipped storage due to --private flag")
+                return body
+
+            user_text = user_text_raw
+
+            # Skip storing command outputs
+            if re.match(r"^(recall|memory|knowledge|source)\s*[:\-]", user_text, re.I):
+                return body
+
+            summary = f"User: {user_text}\nAssistant: {asst_text}"
+            v = embed(summary)
+            if v is None:
+                return body
+
+            conv_id = get_conversation_id(body)
+
+            with db_connect() as conn:
+                recent = conn.execute(
+                    "SELECT embedding FROM memories WHERE user_id=? "
+                    "AND deleted_at IS NULL AND embedding_model=? AND embedding_dim=? "
+                    "ORDER BY id DESC LIMIT 5",
+                    (user_id, EMBED_MODEL_NAME, EMBED_DIM),
+                ).fetchall()
+
+                for (blob,) in recent:
+                    if not blob:
+                        continue
+                    try:
+                        prev = np.frombuffer(blob, dtype=np.float32)
+                        if prev.shape[0] == EMBED_DIM and float(np.dot(v, prev)) > DEDUP_THRESHOLD:
+                            logger.info("Skipped duplicate memory")
+                            return body
+                    except Exception:
+                        continue
+
+                conn.execute(
+                    "INSERT INTO memories(user_id, conversation_id, user_msg, assistant_msg, summary, embedding, embedding_model, embedding_dim) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    (
+                        user_id,
+                        conv_id,
+                        user_text,
+                        asst_text,
+                        summary,
+                        v.tobytes(),
+                        EMBED_MODEL_NAME,
+                        EMBED_DIM,
+                    ),
+                )
+                conn.commit()
+
+            self._write_obsidian(conv_id, user_id, user_text, asst_text)
+            logger.info(f"Stored memory for {user_id} (conv {conv_id[:8]})")
+
+        except Exception as e:
+            logger.error(f"outlet error: {e}")
+        return body
+
+    @staticmethod
+    def _write_obsidian(conv_id: str, user_id: str, user_text: str, asst_text: str):
+        try:
+            short = hashlib.sha1(conv_id.encode()).hexdigest()[:8]
+            date = datetime.now(timezone.utc).strftime("%Y%m%d")
+            fname = f"{date}_{user_id[:8]}_{short}.md"
+            path = os.path.join(VAULT_DIR, fname)
+            ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            entry = (
+                f"\n## {ts}\n\n"
+                f"**User:** {user_text}\n\n"
+                f"**Assistant:** {asst_text}\n"
+            )
+            mode = "a" if os.path.exists(path) else "w"
+            with open(path, mode, encoding="utf-8") as f:
+                if mode == "w":
+                    f.write(f"# Conversation {conv_id}\n")
+                f.write(entry)
+        except Exception as e:
+            logger.warning(f"Obsidian write failed: {e}")
