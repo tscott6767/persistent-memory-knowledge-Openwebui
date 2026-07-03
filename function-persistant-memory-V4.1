@@ -1,0 +1,1653 @@
+"""
+Persistent Memory Filter for OpenWebUI — family edition (v4.1)
+Single-file Filter with inlet (recall/commands/aliases) + outlet (store).
+
+v4.1 changes (7 features):
+  1. Dynamic full-detail tags (DB-backed config, memory tag full/unfull/list commands)
+  2. Two-tier recall (index entries for broad queries, full text for strong matches)
+  3. Same-conversation dedup (skip memories from current chat during auto-recall)
+  4. Recall frequency boosting (use_count × 0.01 added to effective score)
+  5. Time-decay for non-reference, non-pinned memories (-0.10 per 30-day half-life)
+  6. Obsidian vault subfolders (conversations/ for chat, <tag>/ for tagged knowledge)
+  7. memory get: <id|description> command + storage confirmation with memory ID
+
+Requirements:
+  - sentence-transformers (pip install sentence-transformers)
+  - numpy (pip install numpy)
+  - An embedding model (default: BAAI/bge-m3, 1024-dim)
+
+Environment Variables (all optional, defaults shown):
+  MEMORY_BASE_PATH=/app/backend/data
+  MEMORY_DB_PATH=<BASE_PATH>/memories.db
+  MEMORY_VAULT_DIR=<BASE_PATH>/ObsidianVault/Memories
+  MEMORY_EMBED_MODEL=BAAI/bge-m3
+  MEMORY_EMBED_DIM=1024
+"""
+
+import os
+import re
+import json
+import time
+import sqlite3
+import hashlib
+import logging
+from urllib.parse import urlparse
+from datetime import datetime, timezone, timedelta
+
+import numpy as np
+from numpy.linalg import norm
+
+# ───────────────────────────── Config ─────────────────────────────
+# All paths configurable via environment variables — no hardcoded server paths
+BASE_PATH = os.environ.get("MEMORY_BASE_PATH", "/app/backend/data")
+DB_PATH = os.environ.get("MEMORY_DB_PATH", os.path.join(BASE_PATH, "memories.db"))
+VAULT_DIR = os.environ.get("MEMORY_VAULT_DIR", os.path.join(BASE_PATH, "ObsidianVault/Memories"))
+os.makedirs(VAULT_DIR, exist_ok=True)
+
+EMBED_MODEL_NAME = os.environ.get("MEMORY_EMBED_MODEL", "BAAI/bge-m3")
+EMBED_DIM = int(os.environ.get("MEMORY_EMBED_DIM", "1024"))
+
+AUTO_RECALL_MIN_SIM = 0.55
+EXPLICIT_RECALL_MIN_SIM = 0.35
+KNOWLEDGE_AUTO_MIN_SIM = 0.50
+KNOWLEDGE_EXPLICIT_MIN_SIM = 0.30
+
+MAX_ITEMS = 3
+MAX_KNOWLEDGE_ITEMS = 4
+MAX_WORDS_PER_SUMMARY = 300
+MAX_WORDS_PER_KNOWLEDGE = 220
+RECALL_TOKEN_BUDGET = 2500
+RECENCY_HALFLIFE_DAYS = 30
+DEDUP_THRESHOLD = 0.88
+SEARCH_DEDUP_THRESHOLD = 0.93
+
+MAX_KNOWLEDGE_CHARS = 200_000
+LIST_SNIPPET_CHARS = 400
+KNOWLEDGE_SEARCH_WORDS = 120
+
+MAX_EMBED_USER_CHARS = 500
+MAX_EMBED_ASST_CHARS = 350
+
+CONTEXT_EXPAND_MIN_SIM = 0.72
+CONTEXT_EXPAND_MAX_MSGS = 5
+CONTEXT_EXPAND_TOKENS = 600
+
+# ── v4.1: Full-detail tags, two-tier recall, scoring ──
+DEFAULT_FULL_DETAIL_TAGS = {"recipe", "technical", "medical", "reference"}
+FULL_TEXT_SIM_THRESHOLD = 0.80
+RECALL_BOOST_FACTOR = 0.01
+TIME_DECAY_HALFLIFE_DAYS = 30
+TIME_DECAY_MAX_PENALTY = 0.10
+CACHE_TTL = 60
+
+RECALL_BLOCK_MARKER = "Contextual Notes from previous discussion:"
+HOUSEHOLD_USER_ID = "household"
+GLOBAL_OWNER_ID = "global"
+
+PRUNE_AGE_DAYS = 90
+PRUNE_MAX_USE_COUNT = 0
+SCHEMA_VERSION = 4
+
+ALLOWED_KV_KEYS = {"source", "confidence", "scope", "tags", "title", "note"}
+
+_MUTED_USERS = set()
+_PENDING_CONFIRM = {}
+CONFIRM_TTL_MIN = 10
+
+_full_detail_tags_cache = None
+_full_detail_tags_loaded_at = 0
+
+logger = logging.getLogger("memory_filter")
+logging.basicConfig(level=logging.INFO, format="[%(name)s] %(levelname)s %(message)s")
+
+
+# ───────────────────────── Lazy model loader ──────────────────────
+_EMB_MODEL = None
+_EMB_LAST_FAIL_AT = None
+_EMB_RETRY_AFTER_SEC = 60
+
+
+def get_embedder():
+    global _EMB_MODEL, _EMB_LAST_FAIL_AT
+    if _EMB_MODEL is not None:
+        return _EMB_MODEL if _EMB_MODEL is not False else None
+    if _EMB_LAST_FAIL_AT is not None:
+        elapsed = (datetime.now(timezone.utc) - _EMB_LAST_FAIL_AT).total_seconds()
+        if elapsed < _EMB_RETRY_AFTER_SEC:
+            return None
+    try:
+        from sentence_transformers import SentenceTransformer
+        _EMB_MODEL = SentenceTransformer(EMBED_MODEL_NAME)
+        logger.info(f"Loaded embedding model {EMBED_MODEL_NAME}")
+        _EMB_LAST_FAIL_AT = None
+        return _EMB_MODEL
+    except Exception as e:
+        logger.error(f"Failed to load embedding model: {e}")
+        _EMB_MODEL = None
+        _EMB_LAST_FAIL_AT = datetime.now(timezone.utc)
+        return None
+
+
+def embed(text: str):
+    m = get_embedder()
+    if m is None:
+        return None
+    v = m.encode(text, normalize_embeddings=False).astype(np.float32)
+    n = norm(v)
+    return v / n if n > 0 else v
+
+
+# ─────────────────────────── DB helpers ───────────────────────────
+def db_connect():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    return conn
+
+
+def init_db():
+    try:
+        with db_connect() as conn:
+            conn.execute("""CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY)""")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+                    conversation_id TEXT, user_msg TEXT, assistant_msg TEXT,
+                    summary TEXT, embedding BLOB, embedding_model TEXT,
+                    embedding_dim INTEGER, pinned INTEGER DEFAULT 0,
+                    use_count INTEGER DEFAULT 0, last_used_at DATETIME,
+                    deleted_at DATETIME, tags TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user ON memories(user_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_user_active ON memories(user_id, deleted_at)")
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(memories)").fetchall()]
+            if "tags" not in cols:
+                conn.execute("ALTER TABLE memories ADD COLUMN tags TEXT")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS knowledge_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, owner_user_id TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'user', title TEXT, content TEXT NOT NULL,
+                    source_url TEXT, source_domain TEXT, confidence REAL DEFAULT 0.7,
+                    tags TEXT, embedding BLOB, embedding_model TEXT, embedding_dim INTEGER,
+                    pinned INTEGER DEFAULT 0, use_count INTEGER DEFAULT 0,
+                    last_used_at DATETIME, deleted_at DATETIME,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_owner_active ON knowledge_items(owner_user_id, deleted_at)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_knowledge_scope_active ON knowledge_items(scope, deleted_at)")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS source_policies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT, owner_user_id TEXT NOT NULL,
+                    domain TEXT NOT NULL, policy TEXT NOT NULL, note TEXT,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(owner_user_id, domain)
+                )""")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_source_owner_domain ON source_policies(owner_user_id, domain)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_conv ON memories(conversation_id)")
+            # v4.1 Feature 1: config table for dynamic settings
+            conn.execute("""CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT NOT NULL)""")
+            conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+                         ["full_detail_tags", json.dumps(sorted(DEFAULT_FULL_DETAIL_TAGS))])
+            row = conn.execute("SELECT MAX(version) FROM schema_version").fetchone()
+            current = row[0] if row and row[0] is not None else 0
+            if current < SCHEMA_VERSION:
+                conn.execute("INSERT INTO schema_version(version) VALUES(?)", (SCHEMA_VERSION,))
+            conn.commit()
+    except Exception as e:
+        logger.error(f"init_db failed: {e}")
+
+
+init_db()
+
+
+# ─────────────────────────── Utilities ────────────────────────────
+def _content_to_text(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            txt = _content_to_text(item)
+            if txt.strip():
+                parts.append(txt)
+        return "\n".join(parts)
+    if isinstance(content, dict):
+        for key in ("text", "content", "value", "data", "body", "message"):
+            val = content.get(key)
+            if val is not None:
+                txt = _content_to_text(val)
+                if txt.strip():
+                    return txt
+        for val in content.values():
+            txt = _content_to_text(val)
+            if txt.strip():
+                return txt
+    return str(content) if content else ""
+
+
+def _extract_assistant_text(msg: dict) -> str:
+    if not isinstance(msg, dict):
+        return ""
+    text = _content_to_text(msg.get("content")).strip()
+    if text:
+        return text
+    text = _content_to_text(msg.get("output")).strip()
+    if text:
+        return text
+    info = msg.get("info")
+    if isinstance(info, dict):
+        text = _content_to_text(info.get("content")).strip()
+        if text:
+            return text
+        text = _content_to_text(info.get("output")).strip()
+        if text:
+            return text
+    return ""
+
+
+def approx_tokens(text: str) -> int:
+    return max(1, len(text) // 4)
+
+
+def truncate_to_budget(text: str, max_tokens: int) -> str:
+    if approx_tokens(text) <= max_tokens:
+        return text
+    char_budget = int(max_tokens * 4 * 0.9)
+    clipped = text[:char_budget]
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped + " … [truncated]"
+
+
+def truncate_words(text: str, max_words: int) -> str:
+    w = text.split()
+    if len(w) <= max_words:
+        return text
+    return " ".join(w[:max_words]) + " … [truncated]"
+
+
+def truncate_chars(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    clipped = text[:max_chars]
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0]
+    return clipped + " … [truncated]"
+
+
+def strip_recall_block(content) -> str:
+    text = _content_to_text(content)
+    if RECALL_BLOCK_MARKER in text:
+        m = re.search(r"User's Current Question:\s*\n(.*)$", text, re.S)
+        if m:
+            return m.group(1).strip()
+    return text
+
+
+def recency_weight(timestamp_str: str) -> float:
+    try:
+        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - ts).total_seconds() / 86400
+        return 0.5 ** (age_days / RECENCY_HALFLIFE_DAYS)
+    except Exception:
+        return 1.0
+
+
+def get_user_id(__user__):
+    if not __user__ or "id" not in __user__:
+        return None
+    return __user__["id"]
+
+
+def get_conversation_id(body: dict) -> str:
+    return body.get("chat_id") or body.get("id") or "unknown"
+
+
+def normalize_domain(value: str) -> str:
+    if not value:
+        return ""
+    value = value.strip().lower()
+    if not value:
+        return ""
+    if "://" in value:
+        try:
+            host = urlparse(value).netloc.lower()
+        except Exception:
+            host = value
+    else:
+        host = value.split("/")[0].lower()
+    host = host.split("@")[-1]
+    host = host.split(":")[0]
+    if host.startswith("www."):
+        host = host[4:]
+    return host.strip(".")
+
+
+def parse_kv_pipe(text: str):
+    if not text:
+        return "", {}
+    parts = text.split("|")
+    content_segments = [parts[0]]
+    kv = {}
+    for p in parts[1:]:
+        stripped = p.strip()
+        if "=" in stripped:
+            k, v = stripped.split("=", 1)
+            k = k.strip().lower()
+            if k in ALLOWED_KV_KEYS:
+                kv[k] = v.strip()
+                continue
+        content_segments.append(p)
+    content = "|".join(content_segments).strip()
+    return content, kv
+
+
+def scope_to_owner(scope: str, user_id: str) -> str:
+    s = (scope or "user").strip().lower()
+    if s == "household":
+        return HOUSEHOLD_USER_ID
+    if s == "global":
+        return GLOBAL_OWNER_ID
+    return user_id
+
+
+def _set_pending_confirm(user_id: str, cmd: str):
+    _PENDING_CONFIRM[user_id] = {
+        "cmd": cmd,
+        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=CONFIRM_TTL_MIN),
+    }
+
+
+def _pop_pending_confirm_if_valid(user_id: str):
+    item = _PENDING_CONFIRM.get(user_id)
+    if not item:
+        return None
+    if datetime.now(timezone.utc) > item["expires_at"]:
+        _PENDING_CONFIRM.pop(user_id, None)
+        return None
+    _PENDING_CONFIRM.pop(user_id, None)
+    return item["cmd"]
+
+
+def _is_confirm_yes(text: str) -> bool:
+    t = text.strip().lower()
+    return bool(
+        re.match(r"^(confirm\s*:?\s*yes|confirm yes|yes)$", t)
+        or t == "approve" or t == "confirm"
+    )
+
+
+def _extract_previous_content(messages: list) -> str:
+    if not messages or len(messages) < 2:
+        return ""
+    for m in reversed(messages[:-1]):
+        role = m.get("role")
+        c = _content_to_text(m.get("content")).strip()
+        if role in ("user", "assistant") and c:
+            if not re.match(r"^(memory|knowledge|source|recall)\s*[:\-]", c, re.I):
+                return c
+    return ""
+
+
+def _alias_to_core(last: str, messages: list, user_id: str):
+    t = (last or "").strip()
+    low = t.lower()
+    if _is_confirm_yes(t):
+        cmd = _pop_pending_confirm_if_valid(user_id)
+        if cmd:
+            return {"command": cmd}
+        return {"reply": "No pending action to confirm."}
+    if re.match(r"^(memory|knowledge|source)\b", low) or re.match(r"^recall\s*[:\-]\s*", low):
+        return {}
+    m = re.match(r"^/remember\s+(.+)$", t, re.I | re.S)
+    if m:
+        return {"command": f"knowledge add: {m.group(1).strip()} | scope=user"}
+    m = re.match(r"^/(house|household|home)\s+(.+)$", t, re.I | re.S)
+    if m:
+        return {"command": f"knowledge add: {m.group(2).strip()} | scope=household"}
+    m = re.match(r"^/find\s+(.+)$", t, re.I | re.S)
+    if m:
+        return {"command": f"recall: {m.group(1).strip()}"}
+    m = re.match(r"^/trust\s+([a-z0-9.-]+\.[a-z]{2,})$", low)
+    if m:
+        return {"command": f"source prefer: {m.group(1)}"}
+    m = re.match(r"^/(avoid|unreliable)\s+([a-z0-9.-]+\.[a-z]{2,})$", low)
+    if m:
+        return {"command": f"source unreliable: {m.group(2)}"}
+    m = re.match(r"^/block\s+([a-z0-9.-]+\.[a-z]{2,})$", low)
+    if m:
+        cmd = f"source block: {m.group(1)}"
+        _set_pending_confirm(user_id, cmd)
+        return {"reply": f"I'm about to block {m.group(1)}. Reply `confirm yes` within {CONFIRM_TTL_MIN} minutes to proceed."}
+    if re.match(r"^(show|list)\s+(my\s+)?(memories|memory)$", low):
+        return {"command": "memory list:"}
+    if re.match(r"^(show|list)\s+(pinned|pinned memories|pinned memory)$", low):
+        return {"command": "memory list pinned:"}
+    if re.match(r"^(show|list)\s+(knowledge|notes|what you know)$", low):
+        return {"command": "knowledge list:"}
+    if re.match(r"^(show|list)\s+(source rules|sources|source policies)$", low):
+        return {"command": "source list:"}
+    m = re.match(r"^(what do you remember about|find|recall)\s+(.+)$", t, re.I | re.S)
+    if m:
+        return {"command": f"recall: {m.group(2).strip()}"}
+    m = re.match(r"^(trust|prefer)\s+([a-z0-9.-]+\.[a-z]{2,})$", low)
+    if m:
+        return {"command": f"source prefer: {m.group(2)}"}
+    m = re.match(r"^(avoid|unreliable|dont trust|don't trust)\s+([a-z0-9.-]+\.[a-z]{2,})$", low)
+    if m:
+        return {"command": f"source unreliable: {m.group(2)}"}
+    m = re.match(r"^(block)\s+([a-z0-9.-]+\.[a-z]{2,})$", low)
+    if m:
+        cmd = f"source block: {m.group(2)}"
+        _set_pending_confirm(user_id, cmd)
+        return {"reply": f"I'm about to block {m.group(2)}. Reply `confirm yes` within {CONFIRM_TTL_MIN} minutes to proceed."}
+    m = re.match(r"^(remember|save|note)\s+(this|that)?\s*(for\s+(the\s+)?(house|household))?\s*:\s*(.+)$", t, re.I | re.S)
+    if m:
+        house = bool(m.group(5))
+        content = (m.group(6) or "").strip()
+        scope = "household" if house else "user"
+        return {"command": f"knowledge add: {content} | scope={scope}"}
+    if re.match(r"^(remember|save|note)\s+(this|that)$", low):
+        prev = _extract_previous_content(messages)
+        if not prev:
+            return {"reply": "I need the content to save. Try: `Remember this: <text>`."}
+        return {"command": f"knowledge add: {prev} | scope=user"}
+    m = re.match(r"^(remember|save|note)\s+for\s+(the\s+)?(house|household)\s+(.+)$", t, re.I | re.S)
+    if m:
+        return {"command": f"knowledge add: {m.group(4).strip()} | scope=household"}
+    m = re.match(r"^(remember|save|note)\s+(.+)$", t, re.I | re.S)
+    if m:
+        return {"command": f"knowledge add: {m.group(2).strip()} | scope=user"}
+    m = re.match(r"^(forget|delete|remove)\s+memory\s+(\d+)$", low)
+    if m:
+        cmd = f"memory forget: {m.group(2)}"
+        _set_pending_confirm(user_id, cmd)
+        return {"reply": f"I'm about to forget memory {m.group(2)}. Reply `confirm yes` within {CONFIRM_TTL_MIN} minutes to proceed."}
+    m = re.match(r"^(forget|delete|remove)\s+knowledge\s+(\d+)$", low)
+    if m:
+        cmd = f"knowledge forget: {m.group(2)}"
+        _set_pending_confirm(user_id, cmd)
+        return {"reply": f"I'm about to forget knowledge item {m.group(2)}. Reply `confirm yes` within {CONFIRM_TTL_MIN} minutes to proceed."}
+    return {}
+
+
+# ── v4.1 Feature 1: Full-detail tag management ──
+
+def _parse_tags(tags_str):
+    if not tags_str:
+        return set()
+    return {t.strip().lower() for t in tags_str.split(",") if t.strip()}
+
+
+def load_full_detail_tags():
+    global _full_detail_tags_cache, _full_detail_tags_loaded_at
+    now = time.time()
+    if _full_detail_tags_cache is not None and (now - _full_detail_tags_loaded_at) <= CACHE_TTL:
+        return _full_detail_tags_cache
+    try:
+        with db_connect() as conn:
+            row = conn.execute("SELECT value FROM config WHERE key = 'full_detail_tags'").fetchone()
+        if row:
+            _full_detail_tags_cache = set(json.loads(row[0]))
+        else:
+            _full_detail_tags_cache = DEFAULT_FULL_DETAIL_TAGS.copy()
+            with db_connect() as conn:
+                conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
+                             ["full_detail_tags", json.dumps(sorted(DEFAULT_FULL_DETAIL_TAGS))])
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Failed to load full-detail tags: {e}")
+        _full_detail_tags_cache = DEFAULT_FULL_DETAIL_TAGS.copy()
+    _full_detail_tags_loaded_at = now
+    return _full_detail_tags_cache
+
+
+def add_full_detail_tag(tag):
+    global _full_detail_tags_loaded_at
+    tags = load_full_detail_tags()
+    tag = tag.lower().strip()
+    tags.add(tag)
+    with db_connect() as conn:
+        conn.execute("UPDATE config SET value = ? WHERE key = 'full_detail_tags'",
+                     [json.dumps(sorted(tags))])
+        conn.commit()
+    _full_detail_tags_loaded_at = 0
+    return tags
+
+
+def remove_full_detail_tag(tag):
+    global _full_detail_tags_loaded_at
+    tags = load_full_detail_tags()
+    tag = tag.lower().strip()
+    tags.discard(tag)
+    with db_connect() as conn:
+        conn.execute("UPDATE config SET value = ? WHERE key = 'full_detail_tags'",
+                     [json.dumps(sorted(tags))])
+        conn.commit()
+    _full_detail_tags_loaded_at = 0
+    return tags
+
+
+# ── v4.1 Feature 5: Time-decay ──
+
+def _time_decay(mem_tags, pinned, timestamp_str, full_detail_tags):
+    if mem_tags & full_detail_tags:
+        return 0.0
+    if pinned:
+        return 0.0
+    try:
+        ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - ts).total_seconds() / 86400
+        return -TIME_DECAY_MAX_PENALTY * (age_days / TIME_DECAY_HALFLIFE_DAYS)
+    except Exception:
+        return 0.0
+
+
+# ── v4.1 Feature 2: Index entry formatters ──
+
+def _format_index_entry(hit, full_detail_tags):
+    matched_tags = hit.get("tags", set()) & full_detail_tags
+    tag_label = sorted(matched_tags)[0] if matched_tags else "ref"
+    user_msg = hit.get("user_msg", "") or hit.get("summary", "")
+    title = " ".join(user_msg.split()[:6]) if user_msg else "(empty)"
+    desc = " ".join(user_msg.split()[:15]) if user_msg else ""
+    mem_id = f"mem_{hit['id']}"
+    return f"[{tag_label}] {title} — {desc} ({mem_id})"
+
+
+def _format_knowledge_index_entry(h, full_detail_tags):
+    matched_tags = h.get("tags", set()) & full_detail_tags
+    tag_label = sorted(matched_tags)[0] if matched_tags else "ref"
+    title = h.get("title", "") or " ".join(h.get("content", "").split()[:6])
+    desc = " ".join(h.get("content", "").split()[:15])
+    return f"[{tag_label}] {title} — {desc} (id={h['id']})"
+
+
+# ── v4.1 Feature 7a: memory get formatter ──
+
+def _format_memory_full(row):
+    mid, user_msg, assistant_msg, tags_str, ts, conv_id, use_count, pinned = row
+    lines = []
+    lines.append(f"**Memory mem_{mid}**")
+    lines.append(f"📅 {ts}")
+    if tags_str:
+        lines.append(f"🏷️ Tags: {tags_str}")
+    if conv_id:
+        lines.append(f"💬 Conversation: {conv_id[:8]}")
+    lines.append(f"📊 Recalled {use_count or 0} times")
+    if pinned:
+        lines.append("📌 Pinned")
+    lines.append("")
+    lines.append("**User:**")
+    lines.append(user_msg or "(empty)")
+    lines.append("")
+    lines.append("**Assistant:**")
+    lines.append(assistant_msg or "(empty)")
+    return "\n".join(lines)
+
+
+# ─────────────────────────── Core search ──────────────────────────
+
+def search_memories(query, user_id, min_sim, top_k=MAX_ITEMS, exclude_conversation_id=None):
+    q_vec = embed(query)
+    if q_vec is None:
+        return []
+    full_detail_tags = load_full_detail_tags()
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, summary, embedding, timestamp, pinned, user_id, "
+            "user_msg, assistant_msg, tags, conversation_id, use_count "
+            "FROM memories WHERE user_id IN (?, ?) AND deleted_at IS NULL "
+            "AND embedding_model=? AND embedding_dim=?",
+            (user_id, HOUSEHOLD_USER_ID, EMBED_MODEL_NAME, EMBED_DIM),
+        ).fetchall()
+    if not rows:
+        return []
+    scored = []
+    for mid, summary, blob, ts, pinned, owner, user_msg, assistant_msg, tags_str, conv_id, use_count in rows:
+        if not blob:
+            continue
+        if exclude_conversation_id and conv_id == exclude_conversation_id:
+            continue
+        try:
+            emb = np.frombuffer(blob, dtype=np.float32)
+            if emb.shape[0] != EMBED_DIM:
+                continue
+        except Exception:
+            continue
+        sim = float(np.dot(q_vec, emb))
+        mem_tags = _parse_tags(tags_str)
+        effective = sim
+        effective += (use_count or 0) * RECALL_BOOST_FACTOR
+        effective += _time_decay(mem_tags, pinned, ts, full_detail_tags)
+        weighted = effective * recency_weight(ts)
+        if pinned:
+            weighted += 0.15
+        if owner == HOUSEHOLD_USER_ID:
+            weighted += 0.05
+        if sim >= min_sim or pinned:
+            scored.append({
+                "id": mid, "sim": sim, "effective": effective, "weighted": weighted,
+                "summary": summary or "", "user_msg": user_msg or "",
+                "assistant_msg": assistant_msg or "", "tags": mem_tags,
+                "conversation_id": conv_id or "", "recall_count": use_count or 0,
+                "pinned": bool(pinned), "timestamp": ts, "embedding": emb,
+            })
+    scored.sort(key=lambda x: x["weighted"], reverse=True)
+    selected, selected_ids = [], []
+    for hit in scored:
+        if len(selected) >= top_k:
+            break
+        dup = False
+        for prev in selected:
+            if float(np.dot(hit["embedding"], prev["embedding"])) > SEARCH_DEDUP_THRESHOLD:
+                dup = True
+                break
+        if not dup:
+            selected.append(hit)
+            selected_ids.append(hit["id"])
+    if selected_ids:
+        try:
+            with db_connect() as conn:
+                conn.executemany(
+                    "UPDATE memories SET use_count=use_count+1, last_used_at=CURRENT_TIMESTAMP WHERE id=?",
+                    [(i,) for i in selected_ids])
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to update memory use stats: {e}")
+    for hit in selected:
+        del hit["embedding"]
+    return selected
+
+
+# ── v4.0: Auto context expansion ──
+def _expand_conversation_context(query, user_id, min_sim=CONTEXT_EXPAND_MIN_SIM, max_msgs=CONTEXT_EXPAND_MAX_MSGS):
+    q_vec = embed(query)
+    if q_vec is None:
+        return []
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, conversation_id, embedding FROM memories "
+            "WHERE user_id IN (?, ?) AND deleted_at IS NULL "
+            "AND embedding_model=? AND embedding_dim=? AND conversation_id IS NOT NULL",
+            (user_id, HOUSEHOLD_USER_ID, EMBED_MODEL_NAME, EMBED_DIM),
+        ).fetchall()
+    best_conv_id = None
+    best_mid = None
+    best_sim = 0.0
+    for mid, conv_id, blob in rows:
+        if not blob or not conv_id:
+            continue
+        try:
+            emb = np.frombuffer(blob, dtype=np.float32)
+            if emb.shape[0] != EMBED_DIM:
+                continue
+        except Exception:
+            continue
+        sim = float(np.dot(q_vec, emb))
+        if sim > best_sim:
+            best_sim = sim
+            best_conv_id = conv_id
+            best_mid = mid
+    if best_sim < min_sim or not best_conv_id:
+        return []
+    logger.info(f"Context expansion: best_sim={round(best_sim,3)} conv={best_conv_id[:8]}")
+    with db_connect() as conn:
+        conv_rows = conn.execute(
+            "SELECT id, user_msg, assistant_msg, timestamp FROM memories "
+            "WHERE conversation_id=? AND user_id IN (?, ?) AND deleted_at IS NULL AND id != ? "
+            "ORDER BY id ASC LIMIT ?",
+            (best_conv_id, user_id, HOUSEHOLD_USER_ID, best_mid, max_msgs),
+        ).fetchall()
+    return [(r[1] or "", r[2] or "", r[3] or "") for r in conv_rows]
+
+
+def _format_conversation_expansion(conv_memories):
+    if not conv_memories:
+        return ""
+    lines = []
+    for user_msg, asst_msg, ts in conv_memories:
+        u = truncate_words(user_msg, 40)
+        a = truncate_words(asst_msg, 60)
+        lines.append(f"[{ts}] User: {u}\nAssistant: {a}")
+    return "\n---\n".join(lines)
+
+
+def get_source_policy_map(user_id: str):
+    result = {}
+    rank = {GLOBAL_OWNER_ID: 1, HOUSEHOLD_USER_ID: 2, user_id: 3}
+    owners = (GLOBAL_OWNER_ID, HOUSEHOLD_USER_ID, user_id)
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT owner_user_id, domain, policy FROM source_policies WHERE owner_user_id IN (?, ?, ?)",
+            owners).fetchall()
+    tmp = {}
+    for owner, domain, policy in rows:
+        d = normalize_domain(domain)
+        if not d:
+            continue
+        r = rank.get(owner, 0)
+        if d not in tmp or r > tmp[d][0]:
+            tmp[d] = (r, policy.strip().lower())
+    for d, (_, p) in tmp.items():
+        result[d] = p
+    return result
+
+
+_STOP_WORDS = frozenset({
+    "the","a","an","is","are","was","were","be","been","being","have","has","had",
+    "do","does","did","will","would","could","should","may","might","must","can",
+    "to","of","in","on","at","by","for","with","from","as","it","its","this","that",
+    "these","those","and","or","but","not","no","if","then","so","what","how","why",
+    "when","where","who","which","my","your","our","i","you","we","they","he","she",
+    "me","him","her","them","about","into","than","also","just","get","got","like",
+})
+
+
+def _keyword_fallback(query, user_id, limit, exclude_ids, policy_map):
+    terms = [w for w in re.findall(r"\w+", query.lower()) if len(w) >= 2 and w not in _STOP_WORDS]
+    if not terms:
+        return []
+    like_clauses = " OR ".join(["LOWER(content) LIKE ?" for _ in terms])
+    params = [f"%{t}%" for t in terms]
+    params.extend([user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID])
+    with db_connect() as conn:
+        rows = conn.execute(
+            f"""SELECT id, title, content, source_domain, source_url,
+                       confidence, pinned, owner_user_id, timestamp, tags
+                FROM knowledge_items
+                WHERE owner_user_id IN (?, ?, ?) AND deleted_at IS NULL
+                  AND ({like_clauses})
+                ORDER BY pinned DESC, timestamp DESC LIMIT ?""",
+            [*params, limit + len(exclude_ids)],
+        ).fetchall()
+    results = []
+    for kid, title, content, domain, source_url, confidence, pinned, owner, ts, tags_str in rows:
+        if kid in exclude_ids:
+            continue
+        d = normalize_domain(domain or source_url or "")
+        pol = policy_map.get(d)
+        if pol == "block":
+            continue
+        try:
+            conf = float(confidence) if confidence is not None else 0.7
+        except Exception:
+            conf = 0.7
+        conf = min(1.0, max(0.0, conf))
+        content_lower = (content or "").lower()
+        hit_count = sum(1 for t in terms if t in content_lower)
+        mem_tags = _parse_tags(tags_str)
+        full_detail_tags = load_full_detail_tags()
+        weighted = 0.0
+        weighted += (conf - 0.5) * 0.12
+        if pinned:
+            weighted += 0.12
+        if owner == HOUSEHOLD_USER_ID:
+            weighted += 0.04
+        elif owner == GLOBAL_OWNER_ID:
+            weighted += 0.02
+        if pol == "prefer":
+            weighted += 0.08
+        elif pol == "unreliable":
+            weighted -= 0.08
+        weighted += hit_count * 0.01
+        weighted += _time_decay(mem_tags, pinned, ts, full_detail_tags)
+        results.append((weighted, 0.0, kid, title, content, d, conf, pol, tags_str, None, hit_count))
+        if len(results) >= limit:
+            break
+    results.sort(key=lambda x: (x[-1], x[0]), reverse=True)
+    return [r[:10] for r in results]
+
+
+def search_knowledge(query, user_id, min_sim, top_k=MAX_KNOWLEDGE_ITEMS):
+    q_vec = embed(query)
+    policy_map = get_source_policy_map(user_id)
+    full_detail_tags = load_full_detail_tags()
+    scored = []
+    if q_vec is not None:
+        with db_connect() as conn:
+            rows = conn.execute(
+                "SELECT id, title, content, source_domain, source_url, confidence, "
+                "embedding, timestamp, pinned, owner_user_id, tags, use_count "
+                "FROM knowledge_items "
+                "WHERE owner_user_id IN (?, ?, ?) AND deleted_at IS NULL "
+                "AND embedding_model=? AND embedding_dim=?",
+                (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID, EMBED_MODEL_NAME, EMBED_DIM),
+            ).fetchall()
+        for (kid, title, content, domain, source_url, confidence, blob, ts, pinned, owner, tags_str, use_count) in rows:
+            if not blob:
+                continue
+            try:
+                emb = np.frombuffer(blob, dtype=np.float32)
+                if emb.shape[0] != EMBED_DIM:
+                    continue
+            except Exception:
+                continue
+            d = normalize_domain(domain or source_url or "")
+            pol = policy_map.get(d)
+            if pol == "block":
+                continue
+            sim = float(np.dot(q_vec, emb))
+            weighted = sim * recency_weight(ts)
+            try:
+                conf = float(confidence) if confidence is not None else 0.7
+            except Exception:
+                conf = 0.7
+            conf = min(1.0, max(0.0, conf))
+            weighted += (conf - 0.5) * 0.12
+            if pinned:
+                weighted += 0.12
+            if owner == HOUSEHOLD_USER_ID:
+                weighted += 0.04
+            elif owner == GLOBAL_OWNER_ID:
+                weighted += 0.02
+            if pol == "prefer":
+                weighted += 0.08
+            elif pol == "unreliable":
+                weighted -= 0.08
+            weighted += (use_count or 0) * RECALL_BOOST_FACTOR
+            mem_tags = _parse_tags(tags_str)
+            weighted += _time_decay(mem_tags, pinned, ts, full_detail_tags)
+            if sim >= min_sim or pinned:
+                scored.append((weighted, sim, kid, title, content, d, conf, pol, tags_str, emb))
+        scored.sort(key=lambda x: x[0], reverse=True)
+    selected = []
+    for row in scored:
+        if len(selected) >= top_k:
+            break
+        emb = row[-1]
+        dup = False
+        for prev in selected:
+            prev_emb = prev[-1]
+            if prev_emb is not None and emb is not None:
+                if float(np.dot(emb, prev_emb)) > SEARCH_DEDUP_THRESHOLD:
+                    dup = True
+                    break
+        if not dup:
+            selected.append(row)
+    if len(selected) < top_k:
+        existing_ids = {row[2] for row in selected}
+        needed = top_k - len(selected)
+        fallback = _keyword_fallback(query, user_id, needed, existing_ids, policy_map)
+        selected.extend(fallback)
+    if not selected:
+        return []
+    selected_ids = [row[2] for row in selected]
+    if selected_ids:
+        try:
+            with db_connect() as conn:
+                conn.executemany(
+                    "UPDATE knowledge_items SET use_count=use_count+1, last_used_at=CURRENT_TIMESTAMP WHERE id=?",
+                    [(i,) for i in selected_ids])
+                conn.commit()
+        except Exception as e:
+            logger.warning(f"Failed to update knowledge use stats: {e}")
+    out = []
+    for _, sim, kid, title, content, d, conf, pol, tags_str, _ in selected:
+        out.append({
+            "sim": sim, "id": kid, "title": title or "", "content": content or "",
+            "domain": d or "", "confidence": conf, "policy": pol or "normal",
+            "tags": _parse_tags(tags_str),
+        })
+    return out
+
+
+# ── v4.1 Feature 2: Two-tier recall formatters ──
+
+def format_memory_recall(hits):
+    if not hits:
+        return ""
+    full_detail_tags = load_full_detail_tags()
+    index_lines, full_text_lines, snippet_lines = [], [], []
+    for hit in hits:
+        has_full_tag = bool(hit.get("tags", set()) & full_detail_tags)
+        is_strong = hit["sim"] >= FULL_TEXT_SIM_THRESHOLD
+        if has_full_tag:
+            index_lines.append(_format_index_entry(hit, full_detail_tags))
+            if is_strong:
+                full = f"[mem_{hit['id']}] User: {hit.get('user_msg', '')}\nAssistant: {hit.get('assistant_msg', '')}"
+                full_text_lines.append(full)
+        elif is_strong:
+            full = f"[mem_{hit['id']}] User: {hit.get('user_msg', '')}\nAssistant: {hit.get('assistant_msg', '')}"
+            full_text_lines.append(full)
+        else:
+            snip = truncate_words(hit.get("summary") or hit.get("user_msg", ""), MAX_WORDS_PER_SUMMARY)
+            snippet_lines.append(f"(sim={round(hit['sim'],3)}) {snip}")
+    parts = []
+    if index_lines:
+        parts.append("📋 Matching entries:\n" + "\n".join(index_lines))
+    if full_text_lines:
+        parts.append("\n---\n".join(full_text_lines))
+    if snippet_lines:
+        parts.append("\n---\n".join(snippet_lines))
+    return "\n---\n".join(parts) if parts else ""
+
+
+def format_knowledge_recall(hits):
+    if not hits:
+        return ""
+    full_detail_tags = load_full_detail_tags()
+    index_lines, full_text_lines, snippet_lines = [], [], []
+    for h in hits:
+        has_full_tag = bool(h.get("tags", set()) & full_detail_tags)
+        is_strong = h["sim"] >= FULL_TEXT_SIM_THRESHOLD
+        src = h["domain"] if h["domain"] else "unknown"
+        policy_tag = ""
+        if h["policy"] == "prefer":
+            policy_tag = " ✅preferred"
+        elif h["policy"] == "unreliable":
+            policy_tag = " ⚠️unreliable"
+        title = h["title"] if h["title"] else ""
+        if has_full_tag:
+            index_lines.append(_format_knowledge_index_entry(h, full_detail_tags) + f" [source: {src}{policy_tag}]")
+            if is_strong:
+                full_text_lines.append(f"(sim={round(h['sim'],3)}, conf={round(h['confidence'],2)}) {title}{' — ' if title else ''}{h['content']} [source: {src}{policy_tag}]")
+        elif is_strong:
+            full_text_lines.append(f"(sim={round(h['sim'],3)}, conf={round(h['confidence'],2)}) {title}{' — ' if title else ''}{h['content']} [source: {src}{policy_tag}]")
+        else:
+            body = truncate_words(h["content"], MAX_WORDS_PER_KNOWLEDGE)
+            snippet_lines.append(f"(sim={round(h['sim'],3)}, conf={round(h['confidence'],2)}) {title}{' — ' if title else ''}{body} [source: {src}{policy_tag}]")
+    parts = []
+    if index_lines:
+        parts.append("📋 Matching knowledge:\n" + "\n".join(index_lines))
+    if full_text_lines:
+        parts.append("\n---\n".join(full_text_lines))
+    if snippet_lines:
+        parts.append("\n---\n".join(snippet_lines))
+    return "\n---\n".join(parts) if parts else ""
+
+
+def format_source_policy_summary(user_id: str):
+    owners = (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID)
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT owner_user_id, domain, policy FROM source_policies "
+            "WHERE owner_user_id IN (?, ?, ?) ORDER BY owner_user_id, policy, domain",
+            owners).fetchall()
+    if not rows:
+        return "No source policies set."
+    prefer, unreliable, block = [], [], []
+    for owner, domain, policy in rows:
+        d = normalize_domain(domain)
+        if not d:
+            continue
+        mark = "🏠 " if owner == HOUSEHOLD_USER_ID else ("🌐 " if owner == GLOBAL_OWNER_ID else "")
+        item = f"{mark}{d}"
+        p = policy.strip().lower()
+        if p == "prefer":
+            prefer.append(item)
+        elif p == "unreliable":
+            unreliable.append(item)
+        elif p == "block":
+            block.append(item)
+    parts = []
+    if prefer:
+        parts.append("Prefer: " + ", ".join(prefer[:20]))
+    if unreliable:
+        parts.append("Unreliable: " + ", ".join(unreliable[:20]))
+    if block:
+        parts.append("Blocked: " + ", ".join(block[:20]))
+    return " | ".join(parts) if parts else "No source policies set."
+
+
+def build_context_block(query, mem_hits, know_hits, source_policy_text, conv_expansion=None):
+    sections = []
+    if mem_hits:
+        sections.append(f"{RECALL_BLOCK_MARKER}\n{format_memory_recall(mem_hits)}")
+    if conv_expansion:
+        sections.append(f"Related conversation transcript:\n{conv_expansion}")
+    if know_hits:
+        sections.append(f"Knowledge Notes:\n{format_knowledge_recall(know_hits)}")
+    sections.append(f"Source Policy:\n{source_policy_text}")
+    sections.append(f"User's Current Question:\n{query}")
+    return truncate_to_budget("\n\n".join(sections), RECALL_TOKEN_BUDGET)
+
+
+# ───────────────────────── Command handlers ───────────────────────
+def cmd_list(user_id):
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, substr(summary,1,120), pinned, timestamp, user_id "
+            "FROM memories WHERE user_id IN (?, ?) AND deleted_at IS NULL "
+            "ORDER BY pinned DESC, id DESC LIMIT 20",
+            (user_id, HOUSEHOLD_USER_ID)).fetchall()
+    if not rows:
+        return "No memories stored."
+    return "\n".join(
+        f"[{mid}]{' 📌' if p else ''}{' 🏠' if owner == HOUSEHOLD_USER_ID else ''} {ts} — {snip}…"
+        for mid, snip, p, ts, owner in rows)
+
+
+def cmd_memory_search(user_id, query):
+    hits = search_memories(query, user_id, EXPLICIT_RECALL_MIN_SIM, top_k=10)
+    if not hits:
+        return "No matching memories found."
+    lines = []
+    for hit in hits:
+        snip = truncate_words(hit.get("summary") or hit.get("user_msg", ""), 80)
+        tag_str = f" [{','.join(sorted(hit.get('tags', set())))}]" if hit.get("tags") else ""
+        lines.append(f"[mem_{hit['id']}] sim={round(hit['sim'],3)}{tag_str} — {snip}")
+    return "\n---\n".join(lines)
+
+
+def cmd_memory_transcript(user_id, target):
+    try:
+        mid = int(target.strip())
+    except ValueError:
+        return "Usage: memory transcript: <id>"
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT conversation_id FROM memories WHERE id=? AND user_id IN (?, ?) AND deleted_at IS NULL",
+            (mid, user_id, HOUSEHOLD_USER_ID)).fetchone()
+    if not row or not row[0]:
+        return f"No conversation found for memory id={mid}."
+    conv_id = row[0]
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, user_msg, assistant_msg, timestamp FROM memories "
+            "WHERE conversation_id=? AND user_id IN (?, ?) AND deleted_at IS NULL "
+            "ORDER BY id ASC LIMIT 30",
+            (conv_id, user_id, HOUSEHOLD_USER_ID)).fetchall()
+    if not rows:
+        return f"No memories found for conversation {conv_id[:8]}."
+    lines = [f"Conversation {conv_id[:8]} — {len(rows)} messages:"]
+    for mid, user_msg, asst_msg, ts in rows:
+        u = truncate_words(user_msg or "(empty)", 60)
+        a = truncate_words(asst_msg or "(empty)", 100)
+        lines.append(f"\n[{mid}] {ts}\n  User: {u}\n  Assistant: {a}")
+    return "\n".join(lines)
+
+
+# ── v4.1 Feature 7a: memory get command ──
+def cmd_memory_get(user_id, target):
+    target = target.strip()
+    target_clean = target.replace("mem_", "").replace("MEM_", "").strip()
+    if target_clean.isdigit():
+        mem_id = int(target_clean)
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT id, user_msg, assistant_msg, tags, timestamp, "
+                "conversation_id, use_count, pinned "
+                "FROM memories WHERE id=? AND user_id IN (?, ?) AND deleted_at IS NULL",
+                (mem_id, user_id, HOUSEHOLD_USER_ID)).fetchone()
+        if not row:
+            return f"❌ No memory found with ID mem_{mem_id}"
+        return _format_memory_full(row)
+    else:
+        hits = search_memories(target, user_id, EXPLICIT_RECALL_MIN_SIM, top_k=5)
+        full_detail_tags = load_full_detail_tags()
+        tagged_hits = [h for h in hits if h.get("tags") & full_detail_tags]
+        search_hits = tagged_hits if tagged_hits else hits
+        if search_hits:
+            top = search_hits[0]
+            with db_connect() as conn:
+                row = conn.execute(
+                    "SELECT id, user_msg, assistant_msg, tags, timestamp, "
+                    "conversation_id, use_count, pinned "
+                    "FROM memories WHERE id=? AND user_id IN (?, ?) AND deleted_at IS NULL",
+                    (top["id"], user_id, HOUSEHOLD_USER_ID)).fetchone()
+            if row:
+                return _format_memory_full(row)
+        return f"❌ No memories found matching '{target}'"
+
+
+# ── v4.1 Feature 1: Tag management commands ──
+def cmd_tag_full(tag):
+    tag = tag.strip().lower()
+    if not tag:
+        return "Usage: memory tag full: <tag>"
+    tags = add_full_detail_tag(tag)
+    return f"✅ Added `{tag}` to full-detail tags.\nCurrent: {', '.join(sorted(tags))}"
+
+
+def cmd_tag_unfull(tag):
+    tag = tag.strip().lower()
+    if not tag:
+        return "Usage: memory tag unfull: <tag>"
+    tags = remove_full_detail_tag(tag)
+    return f"🗑️ Removed `{tag}` from full-detail tags.\nCurrent: {', '.join(sorted(tags)) if tags else '(none)'}"
+
+
+def cmd_tag_list():
+    tags = load_full_detail_tags()
+    return f"📋 Full-detail tags (always return full text on recall):\n{', '.join(sorted(tags)) if tags else '(none)'}"
+
+
+def cmd_forget(user_id, target):
+    try:
+        mid = int(target.strip())
+    except ValueError:
+        return "Usage: memory forget: <id>"
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE memories SET deleted_at=CURRENT_TIMESTAMP WHERE id=? AND user_id IN (?, ?) AND deleted_at IS NULL",
+            (mid, user_id, HOUSEHOLD_USER_ID))
+        conn.commit()
+    if cur.rowcount == 0:
+        return f"No memory with id={mid} found (or not yours)."
+    return f"Forgotten memory id={mid}."
+
+
+def cmd_pin(user_id, text, household=False):
+    text = text.strip()
+    if not text:
+        return "Usage: memory pin: <text> (or 'memory pin household: <text>')"
+    v = embed(text)
+    if v is None:
+        return "Embedding model unavailable."
+    owner = HOUSEHOLD_USER_ID if household else user_id
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO memories(user_id, summary, user_msg, assistant_msg, embedding, embedding_model, embedding_dim, pinned) VALUES (?,?,?,?,?,?,?,1)",
+            (owner, text, text, "", v.tobytes(), EMBED_MODEL_NAME, EMBED_DIM))
+        conn.commit()
+    label = "🏠 Household" if household else "📌 Pinned"
+    return f"{label}: {text[:80]}"
+
+
+def cmd_stats(user_id):
+    with db_connect() as conn:
+        personal = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(pinned),0), COALESCE(SUM(use_count),0) FROM memories WHERE user_id=? AND deleted_at IS NULL",
+            (user_id,)).fetchone()
+        household = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE user_id=? AND deleted_at IS NULL",
+            (HOUSEHOLD_USER_ID,)).fetchone()
+        knowledge = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(pinned),0), COALESCE(SUM(use_count),0) FROM knowledge_items WHERE owner_user_id IN (?, ?, ?) AND deleted_at IS NULL",
+            (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID)).fetchone()
+    return (f"Memory — Personal: {personal[0]} total, {personal[1]} pinned, {personal[2]} recalls. "
+            f"Household: {household[0]}. Knowledge: {knowledge[0]} total, {knowledge[1]} pinned, {knowledge[2]} recalls.")
+
+
+def cmd_mute(user_id, on):
+    if on:
+        _MUTED_USERS.add(user_id)
+        return "🔇 Memory storage muted for this session."
+    _MUTED_USERS.discard(user_id)
+    return "🔊 Memory storage resumed."
+
+
+def cmd_prune(user_id):
+    with db_connect() as conn:
+        cur = conn.execute(
+            f"UPDATE memories SET deleted_at=CURRENT_TIMESTAMP "
+            f"WHERE user_id=? AND deleted_at IS NULL AND pinned=0 "
+            f"AND use_count<=? AND timestamp < datetime('now', '-{PRUNE_AGE_DAYS} days')",
+            (user_id, PRUNE_MAX_USE_COUNT))
+        conn.commit()
+        return f"Pruned {cur.rowcount} stale memories."
+
+
+def cmd_list_pinned(user_id):
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT id, substr(summary,1,120), timestamp, user_id FROM memories "
+            "WHERE user_id IN (?, ?) AND deleted_at IS NULL AND pinned = 1 ORDER BY id DESC LIMIT 20",
+            (user_id, HOUSEHOLD_USER_ID)).fetchall()
+    if not rows:
+        return "No pinned memories found."
+    return "\n".join(
+        f"[{mid}]{' 🏠' if owner == HOUSEHOLD_USER_ID else ''} {ts} — {snip}…"
+        for mid, snip, ts, owner in rows)
+
+
+def cmd_knowledge_add(user_id, payload):
+    content, kv = parse_kv_pipe(payload)
+    content = content.strip()
+    if not content:
+        return "Usage: knowledge add: <text> | source=<url/domain> | confidence=0.8 | scope=user|household|global | tags=a,b"
+    if MAX_KNOWLEDGE_CHARS and len(content) > MAX_KNOWLEDGE_CHARS:
+        return f"Content too large ({len(content)} chars). Limit is {MAX_KNOWLEDGE_CHARS}. Split into smaller entries."
+    source = kv.get("source", "").strip()
+    source_domain = normalize_domain(source)
+    title = kv.get("title", "").strip() or None
+    tags = kv.get("tags", "").strip() or None
+    try:
+        confidence = float(kv.get("confidence", "0.7"))
+    except Exception:
+        confidence = 0.7
+    confidence = min(1.0, max(0.0, confidence))
+    scope = kv.get("scope", "user").strip().lower()
+    if scope not in {"user", "household", "global"}:
+        scope = "user"
+    owner = scope_to_owner(scope, user_id)
+    emb_text = f"{title or ''}\n{content}\nsource:{source_domain}"
+    v = embed(emb_text)
+    if v is None:
+        return "Embedding model unavailable."
+    with db_connect() as conn:
+        cur = conn.execute(
+            "INSERT INTO knowledge_items(owner_user_id, scope, title, content, source_url, source_domain, confidence, tags, embedding, embedding_model, embedding_dim) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (owner, scope, title, content, source if source else None,
+             source_domain if source_domain else None, confidence, tags, v.tobytes(), EMBED_MODEL_NAME, EMBED_DIM))
+        new_id = cur.lastrowid
+        conn.commit()
+    owner_label = "🏠 household" if owner == HOUSEHOLD_USER_ID else ("🌐 global" if owner == GLOBAL_OWNER_ID else "personal")
+    src_label = source_domain if source_domain else "no-source"
+    tag_info = f", tags={tags}" if tags else ""
+    write_obsidian_knowledge(new_id, owner, title, content, tags, source_domain)
+    return (f"✅ Stored as knowledge id={new_id} ({owner_label}, conf={round(confidence,2)}, "
+            f"source={src_label}{tag_info}, len={len(content)}).\nRetrieve with: knowledge show: {new_id}")
+
+
+def cmd_knowledge_list(user_id, query):
+    query = (query or "").strip()
+    if not query:
+        with db_connect() as conn:
+            rows = conn.execute(
+                f"SELECT id, substr(content,1,{LIST_SNIPPET_CHARS}), source_domain, confidence, pinned, owner_user_id, timestamp, LENGTH(content) "
+                "FROM knowledge_items WHERE owner_user_id IN (?, ?, ?) AND deleted_at IS NULL ORDER BY pinned DESC, id DESC LIMIT 20",
+                (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID)).fetchall()
+        if not rows:
+            return "No knowledge items stored."
+        out_lines = []
+        for kid, snip, dom, conf, p, owner, ts, full_len in rows:
+            badge = " 🏠" if owner == HOUSEHOLD_USER_ID else (" 🌐" if owner == GLOBAL_OWNER_ID else "")
+            pin = " 📌" if p else ""
+            more = "…" if full_len and full_len > LIST_SNIPPET_CHARS else ""
+            out_lines.append(f"[{kid}]{pin}{badge} {ts} — conf={round(conf or 0.0,2)} src={dom or 'n/a'} len={full_len} — {snip}{more}")
+        return "\n".join(out_lines)
+    hits = search_knowledge(query, user_id, min_sim=0.0, top_k=20)
+    if not hits:
+        return "No matching knowledge items."
+    lines = []
+    for h in hits:
+        lines.append(f"[{h['id']}] sim={round(h['sim'],3)} conf={round(h['confidence'],2)} src={h['domain'] or 'n/a'} — {truncate_words(h['content'], KNOWLEDGE_SEARCH_WORDS)}")
+    return "\n".join(lines)
+
+
+def cmd_knowledge_show(user_id, target):
+    try:
+        kid = int(target.strip())
+    except ValueError:
+        return "Usage: knowledge show: <id>"
+    with db_connect() as conn:
+        row = conn.execute(
+            "SELECT id, owner_user_id, scope, title, content, source_url, source_domain, confidence, tags, pinned, timestamp, LENGTH(content) "
+            "FROM knowledge_items WHERE id=? AND owner_user_id IN (?, ?, ?) AND deleted_at IS NULL",
+            (kid, user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID)).fetchone()
+    if not row:
+        return f"No knowledge item with id={kid} (or not accessible)."
+    (kid, owner, scope, title, content, src_url, src_dom, conf, tags, pinned, ts, content_len) = row
+    header = (f"id={kid} scope={scope} owner={owner} pinned={bool(pinned)}\n"
+              f"title={title or '(none)'}\nsource_url={src_url or '(none)'} | source_domain={src_dom or '(none)'}\n"
+              f"confidence={conf} tags={tags or '(none)'}\ntimestamp={ts} content_len={content_len}\n--- CONTENT ---\n")
+    return header + (content or "")
+
+
+def cmd_knowledge_forget(user_id, target):
+    try:
+        kid = int(target.strip())
+    except ValueError:
+        return "Usage: knowledge forget: <id>"
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE knowledge_items SET deleted_at=CURRENT_TIMESTAMP WHERE id=? AND owner_user_id IN (?, ?, ?) AND deleted_at IS NULL",
+            (kid, user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID))
+        conn.commit()
+    if cur.rowcount == 0:
+        return f"No knowledge item with id={kid} found (or not yours)."
+    return f"Forgotten knowledge id={kid}."
+
+
+def cmd_knowledge_pin(user_id, target):
+    try:
+        kid = int(target.strip())
+    except ValueError:
+        return "Usage: knowledge pin: <id>"
+    with db_connect() as conn:
+        cur = conn.execute(
+            "UPDATE knowledge_items SET pinned=1 WHERE id=? AND owner_user_id IN (?, ?, ?) AND deleted_at IS NULL",
+            (kid, user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID))
+        conn.commit()
+    if cur.rowcount == 0:
+        return f"No knowledge item with id={kid} (or not yours)."
+    return f"Pinned knowledge id={kid}."
+
+
+def upsert_source_policy(owner_user_id, domain, policy, note=None):
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO source_policies(owner_user_id, domain, policy, note, updated_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(owner_user_id, domain) DO UPDATE SET policy=excluded.policy, note=excluded.note, updated_at=CURRENT_TIMESTAMP",
+            (owner_user_id, domain, policy, note))
+        conn.commit()
+
+
+def cmd_source_set(user_id, raw, policy):
+    main, kv = parse_kv_pipe(raw)
+    domain = normalize_domain(main)
+    if not domain:
+        return f"Usage: source {policy}: <domain> | scope=user|household|global"
+    scope = kv.get("scope", "user").strip().lower()
+    if scope not in {"user", "household", "global"}:
+        scope = "user"
+    owner = scope_to_owner(scope, user_id)
+    note = kv.get("note")
+    upsert_source_policy(owner, domain, policy, note=note)
+    scope_lbl = "🏠 household" if owner == HOUSEHOLD_USER_ID else ("🌐 global" if owner == GLOBAL_OWNER_ID else "personal")
+    return f"Source policy set: {domain} → {policy} ({scope_lbl})."
+
+
+def cmd_source_remove(user_id, raw):
+    main, kv = parse_kv_pipe(raw)
+    domain = normalize_domain(main)
+    if not domain:
+        return "Usage: source remove: <domain> | scope=user|household|global"
+    scope = kv.get("scope", "user").strip().lower()
+    if scope not in {"user", "household", "global"}:
+        scope = "user"
+    owner = scope_to_owner(scope, user_id)
+    with db_connect() as conn:
+        cur = conn.execute("DELETE FROM source_policies WHERE owner_user_id=? AND domain=?", (owner, domain))
+        conn.commit()
+    return f"Removed {cur.rowcount} source policy for {domain}."
+
+
+def cmd_source_list(user_id):
+    owners = (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID)
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT owner_user_id, domain, policy, updated_at FROM source_policies "
+            "WHERE owner_user_id IN (?, ?, ?) ORDER BY owner_user_id, policy, domain",
+            owners).fetchall()
+    if not rows:
+        return "No source policies set."
+    lines = []
+    for owner, domain, policy, ts in rows:
+        badge = "🏠" if owner == HOUSEHOLD_USER_ID else ("🌐" if owner == GLOBAL_OWNER_ID else "👤")
+        lines.append(f"{badge} {normalize_domain(domain)} → {policy} ({ts})")
+    return "\n".join(lines)
+
+
+# ── v4.1 Feature 6: Obsidian vault subfolders ──
+
+def write_obsidian_knowledge(kid, owner, title, content, tags_str, source_domain):
+    try:
+        full_detail_tags = load_full_detail_tags()
+        mem_tags = _parse_tags(tags_str)
+        matched = mem_tags & full_detail_tags
+        if matched:
+            subdir = sorted(matched)[0]
+        else:
+            subdir = "notes"
+        folder = os.path.join(VAULT_DIR, subdir)
+        os.makedirs(folder, exist_ok=True)
+        date = datetime.now(timezone.utc).strftime("%Y%m%d")
+        safe_title = re.sub(r'[^\w\s-]', '', title or '').strip().replace(' ', '-')[:50]
+        if not safe_title:
+            safe_title = f"item-{kid}"
+        fname = f"{date}_{safe_title}.md"
+        path = os.path.join(folder, fname)
+        ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        lines = [
+            f"# {title or 'Knowledge Item'}",
+            f"**Date:** {ts}",
+            f"**ID:** knowledge_{kid}",
+            f"**Source:** {source_domain or 'unknown'}",
+            f"**Tags:** {tags_str or 'none'}",
+            "",
+            content,
+        ]
+        with open(path, 'w', encoding="utf-8") as f:
+            f.write("\n".join(lines))
+    except Exception as e:
+        logger.warning(f"Obsidian knowledge write failed: {e}")
+
+
+# ─────────────────────────── Filter class ─────────────────────────
+class Filter:
+    def __init__(self):
+        pass
+
+    def inlet(self, body: dict, __user__: dict = None):
+        try:
+            user_id = get_user_id(__user__)
+            if not user_id:
+                return body
+            messages = body.get("messages", [])
+            if not messages or messages[-1].get("role") != "user":
+                return body
+            last_raw = messages[-1].get("content", "")
+            last = _content_to_text(last_raw).strip()
+            low = last.lower()
+
+            alias = _alias_to_core(last, messages, user_id)
+            if alias.get("reply"):
+                return self._reply_inline(body, alias["reply"])
+            if alias.get("command"):
+                last = alias["command"].strip()
+                messages[-1]["content"] = last
+                low = last.lower()
+
+            # v4.1 Feature 1: Tag management commands
+            if low.startswith("memory tag full:"):
+                return self._reply_inline(body, cmd_tag_full(last.split(":", 1)[1]))
+            if low.startswith("memory tag unfull:"):
+                return self._reply_inline(body, cmd_tag_unfull(last.split(":", 1)[1]))
+            if low.startswith("memory tag list:"):
+                return self._reply_inline(body, cmd_tag_list())
+
+            # v4.1 Feature 7a: memory get command
+            if low.startswith("memory get:"):
+                return self._reply_inline(body, cmd_memory_get(user_id, last.split(":", 1)[1]))
+
+            # memory commands
+            if low.startswith("memory list pinned:"):
+                return self._reply_inline(body, cmd_list_pinned(user_id))
+            if low.startswith("memory list:"):
+                return self._reply_inline(body, cmd_list(user_id))
+            if low.startswith("memory search:"):
+                return self._reply_inline(body, cmd_memory_search(user_id, last.split(":", 1)[1]))
+            if low.startswith("memory transcript:"):
+                return self._reply_inline(body, cmd_memory_transcript(user_id, last.split(":", 1)[1]))
+            if low.startswith("memory stats:"):
+                return self._reply_inline(body, cmd_stats(user_id))
+            if low.startswith("memory forget:"):
+                return self._reply_inline(body, cmd_forget(user_id, last.split(":", 1)[1]))
+            if low.startswith("memory pin household:"):
+                return self._reply_inline(body, cmd_pin(user_id, last.split(":", 1)[1], household=True))
+            if low.startswith("memory pin:"):
+                return self._reply_inline(body, cmd_pin(user_id, last.split(":", 1)[1]))
+            if low.startswith("memory mute:"):
+                return self._reply_inline(body, cmd_mute(user_id, True))
+            if low.startswith("memory unmute:"):
+                return self._reply_inline(body, cmd_mute(user_id, False))
+            if low.startswith("memory prune:"):
+                return self._reply_inline(body, cmd_prune(user_id))
+
+            # knowledge commands
+            if low.startswith("knowledge add:"):
+                return self._reply_inline(body, cmd_knowledge_add(user_id, last.split(":", 1)[1]))
+            if low.startswith("knowledge list:"):
+                return self._reply_inline(body, cmd_knowledge_list(user_id, last.split(":", 1)[1]))
+            if low.startswith("knowledge show:"):
+                return self._reply_inline(body, cmd_knowledge_show(user_id, last.split(":", 1)[1]))
+            if low.startswith("knowledge forget:"):
+                return self._reply_inline(body, cmd_knowledge_forget(user_id, last.split(":", 1)[1]))
+            if low.startswith("knowledge pin:"):
+                return self._reply_inline(body, cmd_knowledge_pin(user_id, last.split(":", 1)[1]))
+
+            # source commands
+            if low.startswith("source prefer:"):
+                return self._reply_inline(body, cmd_source_set(user_id, last.split(":", 1)[1], "prefer"))
+            if low.startswith("source unreliable:"):
+                return self._reply_inline(body, cmd_source_set(user_id, last.split(":", 1)[1], "unreliable"))
+            if low.startswith("source block:"):
+                return self._reply_inline(body, cmd_source_set(user_id, last.split(":", 1)[1], "block"))
+            if low.startswith("source remove:"):
+                return self._reply_inline(body, cmd_source_remove(user_id, last.split(":", 1)[1]))
+            if low.startswith("source list:") or low == "source list":
+                return self._reply_inline(body, cmd_source_list(user_id))
+
+            # explicit recall
+            m = re.match(r"^recall\s*[:\-]\s*(.+)$", last, re.I | re.S)
+            if m:
+                query = m.group(1).strip()
+                conv_id = get_conversation_id(body)
+                mem_hits = search_memories(query, user_id, EXPLICIT_RECALL_MIN_SIM, exclude_conversation_id=conv_id)
+                know_hits = search_knowledge(query, user_id, KNOWLEDGE_EXPLICIT_MIN_SIM)
+                src_txt = format_source_policy_summary(user_id)
+                conv_expansion = None
+                if mem_hits:
+                    conv_memories = _expand_conversation_context(query, user_id)
+                    if conv_memories:
+                        conv_expansion = truncate_to_budget(_format_conversation_expansion(conv_memories), CONTEXT_EXPAND_TOKENS)
+                if mem_hits or know_hits or conv_expansion:
+                    block = build_context_block(query, mem_hits, know_hits, src_txt, conv_expansion)
+                    self._inject_system(messages, block)
+                    messages[-1]["content"] = query
+                    logger.info(f"Explicit recall: mem={len(mem_hits)} knowledge={len(know_hits)} conv_expand={bool(conv_expansion)} for {user_id}")
+                return body
+
+            # automatic background recall
+            query_text = re.sub(r"\s*--private\b", "", last).strip()
+            conv_id = get_conversation_id(body)
+            mem_hits = search_memories(query_text, user_id, AUTO_RECALL_MIN_SIM, exclude_conversation_id=conv_id)
+            know_hits = search_knowledge(query_text, user_id, KNOWLEDGE_AUTO_MIN_SIM)
+            src_txt = format_source_policy_summary(user_id)
+            conv_expansion = None
+            if mem_hits:
+                conv_memories = _expand_conversation_context(query_text, user_id)
+                if conv_memories:
+                    conv_expansion = truncate_to_budget(_format_conversation_expansion(conv_memories), CONTEXT_EXPAND_TOKENS)
+            if mem_hits or know_hits or conv_expansion:
+                block = build_context_block(query_text, mem_hits, know_hits, src_txt, conv_expansion)
+                self._inject_system(messages, block)
+                logger.info(f"Auto recall: mem={len(mem_hits)} knowledge={len(know_hits)} conv_expand={bool(conv_expansion)} for {user_id}")
+
+        except Exception as e:
+            logger.error(f"inlet error: {e}")
+        return body
+
+    @staticmethod
+    def _inject_system(messages: list, block: str):
+        sys_msg = {"role": "system", "content": block}
+        messages.insert(len(messages) - 1, sys_msg)
+
+    @staticmethod
+    def _reply_inline(body: dict, text: str):
+        messages = body.get("messages", [])
+        if messages and messages[-1].get("role") == "user":
+            messages[-1]["content"] = (
+                "Respond with exactly the following text and nothing else, "
+                "no preamble, no quoting, no commentary:\n\n"
+                f"{text}"
+            )
+        body["_memory_short_circuit"] = True
+        return body
+
+    def outlet(self, body: dict, __user__: dict = None):
+        logger.info(f"OUTLET_FIRED keys={list(body.keys()) if isinstance(body, dict) else 'N/A'}")
+        try:
+            if body.get("_memory_short_circuit"):
+                logger.info("OUTLET_EXIT: short_circuit")
+                return body
+            user_id = get_user_id(__user__)
+            if not user_id:
+                logger.info("OUTLET_EXIT: no user_id")
+                return body
+            if user_id in _MUTED_USERS:
+                logger.info("OUTLET_EXIT: muted")
+                return body
+            messages = body.get("messages", [])
+            logger.info(f"OUTLET_MSGS: count={len(messages)}")
+            if len(messages) < 2:
+                logger.info("OUTLET_EXIT: too few messages")
+                return body
+            asst = next((m for m in reversed(messages) if m.get("role") == "assistant"), None)
+            if not asst:
+                logger.info("OUTLET_EXIT: no assistant message")
+                return body
+            asst_text = _extract_assistant_text(asst)
+            logger.info(f"OUTLET_ASST: text_len={len(asst_text)}")
+            if not asst_text:
+                logger.info("OUTLET_EXIT: empty assistant text")
+                return body
+            user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+            if not user:
+                logger.info("OUTLET_EXIT: no user message")
+                return body
+            user_text_raw = strip_recall_block(user.get("content", "")).strip()
+            logger.info(f"OUTLET_USER: content_len={len(user_text_raw)}")
+            if not user_text_raw:
+                logger.info("OUTLET_EXIT: empty user text")
+                return body
+            if "--private" in user_text_raw.lower():
+                logger.info("Skipped storage due to --private flag")
+                return body
+            if user_text_raw.startswith("Respond with exactly the following text and nothing else"):
+                logger.info("Skipped storage for inline control prompt")
+                return body
+            user_text = user_text_raw.strip()
+            if re.match(r"^(recall|memory|knowledge|source)\s*[:\-]", user_text, re.I):
+                logger.info("OUTLET_EXIT: command message (not stored)")
+                return body
+            if user_text.startswith("/"):
+                logger.info("OUTLET_EXIT: slash command (not stored)")
+                return body
+
+            user_text_full = user_text
+            asst_text_full = asst_text
+            embed_input = (f"User: {truncate_chars(user_text, MAX_EMBED_USER_CHARS)}\n"
+                          f"Assistant: {truncate_chars(asst_text, MAX_EMBED_ASST_CHARS)}")
+            v = embed(embed_input)
+            if v is None:
+                logger.info("OUTLET_EXIT: embed failed")
+                return body
+            conv_id = get_conversation_id(body)
+
+            with db_connect() as conn:
+                recent = conn.execute(
+                    "SELECT embedding FROM memories WHERE user_id=? AND deleted_at IS NULL "
+                    "AND embedding_model=? AND embedding_dim=? ORDER BY id DESC LIMIT 5",
+                    (user_id, EMBED_MODEL_NAME, EMBED_DIM)).fetchall()
+                for (blob,) in recent:
+                    if not blob:
+                        continue
+                    try:
+                        prev = np.frombuffer(blob, dtype=np.float32)
+                        if prev.shape[0] == EMBED_DIM and float(np.dot(v, prev)) > DEDUP_THRESHOLD:
+                            logger.info("Skipped duplicate memory")
+                            return body
+                    except Exception:
+                        continue
+                cur = conn.execute(
+                    "INSERT INTO memories(user_id, conversation_id, user_msg, assistant_msg, summary, embedding, embedding_model, embedding_dim) VALUES (?,?,?,?,?,?,?,?)",
+                    (user_id, conv_id, user_text_full, asst_text_full, embed_input, v.tobytes(), EMBED_MODEL_NAME, EMBED_DIM))
+                mem_id = cur.lastrowid
+                conn.commit()
+
+            self._write_obsidian(conv_id, user_id, user_text_full, asst_text_full)
+            logger.info(f"Stored memory mem_{mem_id} for {user_id} (conv {conv_id[:8]}) user_len={len(user_text_full)} asst_len={len(asst_text_full)}")
+
+        except Exception as e:
+            logger.error(f"outlet error: {e}")
+        return body
+
+    @staticmethod
+    def _write_obsidian(conv_id, user_id, user_text, asst_text):
+        try:
+            folder = os.path.join(VAULT_DIR, "conversations")
+            os.makedirs(folder, exist_ok=True)
+            short = hashlib.sha1(conv_id.encode()).hexdigest()[:8]
+            date = datetime.now(timezone.utc).strftime("%Y%m%d")
+            fname = f"{date}_{user_id[:8]}_{short}.md"
+            path = os.path.join(folder, fname)
+            ts = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            entry = f"\n## {ts}\n\n**User:** {user_text}\n\n**Assistant:** {asst_text}\n"
+            mode = "a" if os.path.exists(path) else "w"
+            with open(path, mode, encoding="utf-8") as f:
+                if mode == "w":
+                    f.write(f"# Conversation {conv_id}\n")
+                f.write(entry)
+        except Exception as e:
+            logger.warning(f"Obsidian write failed: {e}")
