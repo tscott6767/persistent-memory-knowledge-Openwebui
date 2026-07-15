@@ -1,5 +1,4 @@
 # OpenWebUI Persistent Memory Filter
-
 A self-contained memory and knowledge system for [Open WebUI](https://github.com/open-webui/open-webui). Provides automatic conversation recall, manual knowledge storage, source policy management, and Obsidian vault integration — all in a single Python filter file.
 
 ## Features
@@ -39,7 +38,7 @@ pip install sentence-transformers numpy
 
 1. In Open WebUI, go to **Settings → Functions**
 2. Click **Create Function**
-3. Paste the entire contents of `memory_knowledge_function.py`
+3. Paste the entire contents of `function-persistent-memory-V4.1`
 4. Save and enable the filter (set as global if you want it for all users)
 
 The database and Obsidian vault are created automatically on first run.
@@ -51,8 +50,8 @@ All paths and model settings are configurable via environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `MEMORY_BASE_PATH` | `/app/backend/data` | Base data directory |
-| `MEMORY_DB_PATH` | `<BASE_PATH>/memories.db` | SQLite database path |
-| `MEMORY_VAULT_DIR` | `<BASE_PATH>/ObsidianVault/Memories` | Obsidian vault output directory |
+| `MEMORY_DB_PATH` | `/memories.db` | SQLite database path |
+| `MEMORY_VAULT_DIR` | `/ObsidianVault/Memories` | Obsidian vault output directory |
 | `MEMORY_EMBED_MODEL` | `BAAI/bge-m3` | HuggingFace embedding model name |
 | `MEMORY_EMBED_DIM` | `1024` | Embedding dimension (must match model) |
 
@@ -205,7 +204,7 @@ vault/
 | `use_count` | INTEGER | Times recalled |
 | `tags` | TEXT | Comma-separated tags |
 | `timestamp` | DATETIME | Creation time |
-| `deleted_at` | DATETIME | Soft-delete timesp |
+| `deleted_at` | DATETIME | Soft-delete timestamp |
 
 ### `knowledge_items` table
 Similar structure, with additional fields: `scope`, `title`, `source_url`, `source_domain`, `confidence`.
@@ -240,9 +239,18 @@ Key constants in the config section of the file:
 | `TIME_DECAY_HALFLIFE_DAYS` | 30 | Days for -0.10 penalty on casual memories |
 | `CONTEXT_EXPAND_MIN_SIM` | 0.72 | Similarity to trigger conversation expansion |
 
+## Repository Contents
+
+| File | Description |
+|---|---|
+| `function-persistent-memory-V4.1` | The filter source code. Paste this into Open WebUI Functions. |
+| `knowledge capture template.md` | A reusable prompt template for extracting and storing structured content (recipes, technical docs, etc.) with proper tags. Save as a Prompt in Open WebUI Workspace. |
+| `system prompt.md` | A reference system prompt that tells the model how to use the memory system, handle sources, calibrate confidence, and manage file safety. Adapt to your own deployment. |
+| `LICENSE` | GPL-3.0 |
+
 ## License
 
-GPL3.0 
+GPL-3.0
 
 ## Changelog
 
