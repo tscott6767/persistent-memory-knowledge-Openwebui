@@ -2,10 +2,24 @@
 
 A hybrid **Filter + Tool** architecture that gives Open WebUI persistent memory, semantic knowledge search, and source policy management — all stored locally in SQLite with vector embeddings.
 
+## What's New
+
+### v5.1 — Memory Filter (Aug 2026)
+- **Pattern-based auto-tagging** — Detects infrastructure, path, decision, config, hardware, and fix patterns in assistant responses. Tagged exchanges get enhanced embeddings for better future recall.
+- **Technical content extraction** — Key technical lines (commands, paths, configs) are extracted and prepended to the stored memory embedding, improving semantic searchability.
+- **Trivial exchange filtering** — Short acknowledgment responses ("ok", "got it", "done") are skipped to reduce noise in the memory store.
+
+### v4 — System Prompt (Aug 2026)
+- **Memory Storage Protocol** — 7 explicit "store immediately" triggers that tell models when they MUST persist information (working commands, infrastructure changes, decisions, hardware specs, problem fixes, file paths, explicit user requests).
+- **5-layer storage hierarchy** — Clear distinction between persistent memory, knowledge items, chat history, notes, and knowledge bases.
+- **Context integrity canary** — CK timestamp stamp that makes it visible when a model has lost context.
+
 ## Features
 
 - **Auto-recall** — Relevant past conversations and knowledge are automatically injected as context into every new message (Filter inlet)
 - **Auto-store** — Each conversation exchange is automatically saved as a memory (Filter outlet)
+- **Pattern-based tagging** — Technical content is auto-detected and tagged (infrastructure, path, decision, config, hardware, fix) for better searchability
+- **Trivial exchange filtering** — Short acknowledgment responses are skipped to keep the memory store clean
 - **Model-callable tools** — The LLM can search, store, list, delete, and pin memories/knowledge via function-calling (no text command parsing)
 - **Semantic search** — Uses `BAAI/bge-m3` sentence-transformer embeddings with graceful keyword fallback
 - **Knowledge items** — Curated facts/references with source domains, confidence scores, and tags
@@ -22,9 +36,10 @@ A hybrid **Filter + Tool** architecture that gives Open WebUI persistent memory,
 | Component | File | Role |
 |-----------|------|------|
 | **Shared core** | `memory_core.py` | DB schema, embeddings, search, storage, formatting, Obsidian sync — imported by both Filter and Tool |
-| **Filter** | `memory_filter.py` | Inlet: auto-recall. Outlet: auto-store. Zero command parsing. |
+| **Filter** | `memory_filter.py` | Inlet: auto-recall. Outlet: auto-store with pattern tagging + trivial filtering. |
 | **Tool** | `memory_tool.py` | All memory/knowledge/source operations as model-callable methods |
 | **Migration** | `migrate_v5.py` | Schema check, function cleanup, core installation |
+| **System prompt** | `system prompt.md` | Reference system prompt with Memory Storage Protocol and 5-layer hierarchy |
 
 ### Why split Filter and Tool?
 
@@ -33,6 +48,41 @@ Open WebUI has two function types:
 - **Tools** expose methods the model can call via function-calling. The model decides when to use them.
 
 This system gives each job to the right mechanism: the Filter handles passive recall/store, the Tool handles interactive operations.
+
+### How the Filter and System Prompt Work Together
+
+The **system prompt** tells the model *when and why* to store memories (the 7 explicit triggers in the Memory Storage Protocol). The **filter** provides a safety net — it automatically stores exchanges even when the model doesn't proactively call `memory_store`. The filter also enhances stored content with pattern-based tagging and technical content extraction that the model wouldn't know to add.
+
+This dual approach ensures:
+1. Models that follow the system prompt will proactively store important context
+2. Models that don't (or can't) still get coverage from the filter
+3. Technical content gets properly tagged and enhanced for future searchability
+
+## Memory Filter v5.1 Details
+
+### Pattern Detection
+
+The filter scans assistant responses for storeable technical content using regex patterns across 6 categories:
+
+| Tag | Detects |
+|-----|--------|
+| `infrastructure` | Commands (systemctl, docker, cmake, pct, qm), flags (--port, --ctx-size, -ngl), binary paths |
+| `path` | File paths starting with /opt, /etc, /var, /usr, /home, /projects, /models, etc. |
+| `decision` | Switch/choose/decided/migrated/deprecated/decommissioned language |
+| `config` | Key=value pairs, config files (.service, .conf, .yaml, .json, .env), systemd units |
+| `hardware` | Hardware mentions (Xeon, RTX, GPU, VRAM, RAM, NVMe, SSD, PCIe, ZFS) |
+| `fix` | Problem resolution language (fixed, resolved, root cause, the error was) |
+
+### Technical Content Extraction
+
+When patterns are detected, key technical lines (commands, paths, configs) are extracted from the assistant response and prepended to the memory embedding. This ensures future semantic searches can find the technical content even if the user's question was phrased differently.
+
+### Trivial Exchange Filtering
+
+Exchanges are skipped when:
+- The assistant response is under 30 characters (unless patterns are detected)
+- The response is a pure acknowledgment ("ok", "got it", "will do", etc.)
+- The response is very short with no sentence punctuation
 
 ## Tool Methods (model-callable)
 
@@ -117,7 +167,7 @@ The script will:
 
 3. **Create the Filter in OWUI:**
    - Admin → Functions → New Filter
-   - Name: `Memory Filter v5`
+   - Name: `Memory Filter v5.1`
    - Paste contents of `memory_filter.py`
    - Set as global, activate
 
@@ -131,10 +181,16 @@ The script will:
    - Workspace → Models → edit your model
    - Enable the Memory Tool v5 in the tools list
 
-6. **Test:**
+6. **Set the system prompt:**
+   - Admin → Settings → General (or per-model)
+   - Paste the contents of `system prompt.md`
+   - Adapt the identity, paths, and project references to your deployment
+
+7. **Test:**
    - Ask: "What do you remember about me?" → should trigger `memory_search`
-   - Have a short conversation → check logs for auto-store firing
+   - Have a short conversation → check logs for auto-store firing with tags
    - Try: "Store this: the WiFi password is X" → should call `knowledge_add`
+   - Check logs for pattern detection: `Auto-store with tags [infrastructure, path] for...`
 
 ## Database Schema
 
@@ -142,7 +198,7 @@ All data is stored in SQLite (`memories.db` in the OWUI data directory). No exte
 
 | Table | Purpose |
 |-------|---------|
-| `memories` | Conversation memories (auto-stored + pinned) |
+| `memories` | Conversation memories (auto-stored + pinned, with tags) |
 | `knowledge_items` | Curated knowledge entries |
 | `source_policies` | Domain trust/block rules |
 | `config` | Key-value settings (full_detail_tags) |
@@ -171,6 +227,15 @@ All configuration is via environment variables (set in OWUI container):
 - Prefix any message with `--private` to prevent both recall and storage
 - `memory_mute()` temporarily disables auto-storage for the session
 - Delete individual memories or knowledge items at any time via tool calls
+
+## Version History
+
+| Version | Date | Changes |
+|---------|------|---------|
+| Memory Filter v5.1 | Aug 2026 | Pattern-based tagging, technical content extraction, trivial exchange filtering |
+| Memory Filter v5.0 | Aug 2026 | Initial filter release — auto-recall + auto-store |
+| System Prompt v4 | Aug 2026 | Memory Storage Protocol (7 triggers), 5-layer hierarchy, CK canary |
+| Memory Core v5 | Jul 2026 | Shared core with embeddings, Obsidian sync, source policies |
 
 ## License
 
