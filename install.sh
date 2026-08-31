@@ -86,8 +86,8 @@ echo ""
 if [[ "$INSTALL_MODE" == "docker" ]]; then
     docker cp "$MIGRATE_FILE" "${CONTAINER_NAME}:/tmp/migrate_v5.py" 2>/dev/null || true
     # Run non-interactively (migration is read-only except for optional cleanup)
-    docker exec -it "$CONTAINER_NAME" python3 /tmp/migrate_v5.py <<< "n" || \
-    docker exec "$CONTAINER_NAME" python3 /tmp/migrate_v5.py <<< "n" || \
+    # NOTE: use -i (not -it) — a TTY is not available when stdin is redirected
+    docker exec -i "$CONTAINER_NAME" python3 /tmp/migrate_v5.py <<< "n" || \
     echo -e "${YELLOW}  ⚠️  Migration script could not run automatically. Run manually:${NC}"
     echo -e "     docker exec -it ${CONTAINER_NAME} python3 /tmp/migrate_v5.py"
 else
@@ -106,7 +106,7 @@ echo -e "${GREEN}Next steps — create the Filter and Tool in OWUI admin:${NC}"
 echo ""
 echo -e "  ${YELLOW}1. Create Filter:${NC}"
 echo -e "     Admin → Functions → New Filter"
-echo -e "     Name: Memory Filter v5"
+echo -e "     Name: Memory Filter v5.1"
 echo -e "     Paste contents of memory_filter.py"
 echo -e "     Toggle: ON, Global: YES"
 echo ""
@@ -127,9 +127,16 @@ else
     echo -e "     pip install numpy sentence-transformers tiktoken"
 fi
 echo ""
-echo -e "  ${YELLOW}5. Test:${NC}"
+echo -e "  ${YELLOW}5. Set the system prompt:${NC}"
+echo -e "     Admin → Settings → General (or per-model in Workspace → Models)"
+echo -e "     Paste the contents of 'system prompt.md'"
+echo -e "     Adapt the identity, paths, and project references to your deployment"
+echo ""
+echo -e "  ${YELLOW}6. Test:${NC}"
 echo -e '     Ask: "What do you remember about me?"'
 echo -e "     → Should trigger memory_search tool call"
 echo ""
-echo -e "  ${YELLOW}6. Deactivate any old memory filters${NC} (if upgrading from v4)"
+echo -e "  ${YELLOW}7. Deactivate any old memory filters${NC} (if upgrading from v4.x)"
+echo -e "     legacy/function-persistent-memory-V4.1 is NOT compatible with v5 — do not"
+echo -e "     run it alongside the new Filter/Tool pair"
 echo ""
