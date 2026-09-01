@@ -67,6 +67,8 @@ CONTEXT_EXPAND_TOKENS = 600
 # Full-detail tags (always return full text on recall)
 DEFAULT_FULL_DETAIL_TAGS = {"recipe", "technical", "medical", "reference"}
 FULL_TEXT_SIM_THRESHOLD = 0.80
+# v5.2: pinned items must still clear a relevance floor to be auto-recalled
+PINNED_MIN_SIM = 0.45
 RECALL_BOOST_FACTOR = 0.01
 TIME_DECAY_HALFLIFE_DAYS = 30
 TIME_DECAY_MAX_PENALTY = 0.10
@@ -74,6 +76,19 @@ CACHE_TTL = 60
 
 RECALL_BLOCK_MARKER = "Contextual Notes from previous discussion:"
 HOUSEHOLD_USER_ID = "household"
+HOUSEHOLD_MEMBER_IDS = {
+    "REMOVED-HOUSEHOLD-UUID",  # Tony
+    "REMOVED-HOUSEHOLD-UUID",  # Maria
+}
+
+def is_household_member(user_id: str) -> bool:
+    return user_id in HOUSEHOLD_MEMBER_IDS
+
+def get_household_id(user_id: str) -> str:
+    """Returns 'household' for members, phantom ID for non-members."""
+    if is_household_member(user_id):
+        return HOUSEHOLD_USER_ID
+    return "__no_household_access__"
 GLOBAL_OWNER_ID = "global"
 
 PRUNE_AGE_DAYS = 90
@@ -334,6 +349,8 @@ def parse_tags(tags_str) -> set:
 def scope_to_owner(scope: str, user_id: str) -> str:
     s = (scope or "user").strip().lower()
     if s == "household":
+        if not is_household_member(user_id):
+            return user_id  # Non-members fall back to personal scope
         return HOUSEHOLD_USER_ID
     if s == "global":
         return GLOBAL_OWNER_ID
@@ -438,9 +455,12 @@ def _get_adaptive_search_dedup_threshold() -> float:
 def search_memories(query: str, user_id: str, min_sim: float,
                     top_k: int = MAX_ITEMS,
                     exclude_conversation_id: str = None) -> list:
+    t0 = time.time()
     q_vec = embed(query)
     if q_vec is None:
         return []
+    _embed_ms = (time.time() - t0) * 1000
+    t0 = time.time()
     full_detail_tags = load_full_detail_tags()
     search_dedup = _get_adaptive_search_dedup_threshold()
     with db_connect() as conn:
@@ -449,7 +469,7 @@ def search_memories(query: str, user_id: str, min_sim: float,
             "user_msg, assistant_msg, tags, conversation_id, use_count "
             "FROM memories WHERE user_id IN (?, ?) AND deleted_at IS NULL "
             "AND embedding_model=? AND embedding_dim=?",
-            (user_id, HOUSEHOLD_USER_ID, EMBED_MODEL_NAME, EMBED_DIM),
+            (user_id, get_household_id(user_id), EMBED_MODEL_NAME, EMBED_DIM),
         ).fetchall()
     if not rows:
         return []
@@ -469,14 +489,14 @@ def search_memories(query: str, user_id: str, min_sim: float,
         sim = float(np.dot(q_vec, emb))
         mem_tags = parse_tags(tags_str)
         effective = sim
-        effective += (use_count or 0) * RECALL_BOOST_FACTOR
+        effective += min(use_count or 0, 10) * RECALL_BOOST_FACTOR
         effective += time_decay(mem_tags, pinned, ts, full_detail_tags)
         weighted = effective * recency_weight(ts)
         if pinned:
             weighted += 0.15
         if owner == HOUSEHOLD_USER_ID:
             weighted += 0.05
-        if sim >= min_sim or pinned:
+        if sim >= min_sim or (pinned and sim >= PINNED_MIN_SIM):
             scored.append({
                 "id": mid, "sim": sim, "effective": effective, "weighted": weighted,
                 "summary": summary or "", "user_msg": user_msg or "",
@@ -509,6 +529,11 @@ def search_memories(query: str, user_id: str, min_sim: float,
             logger.warning(f"Failed to update memory use stats: {e}")
     for hit in selected:
         del hit["embedding"]
+    _scan_ms = (time.time() - t0) * 1000
+    _mean_sim = sum(h["sim"] for h in selected) / len(selected) if selected else 0.0
+    logger.info(
+        f"search_memories: selected={len(selected)} embed_ms={_embed_ms:.1f} "
+        f"scan_ms={_scan_ms:.1f} mean_sim={_mean_sim:.3f}")
     return selected
 
 # ───────────────────────── Conversation context expansion ─────────────────────────
@@ -523,7 +548,7 @@ def expand_conversation_context(query: str, user_id: str,
             "SELECT id, conversation_id, embedding FROM memories "
             "WHERE user_id IN (?, ?) AND deleted_at IS NULL "
             "AND embedding_model=? AND embedding_dim=? AND conversation_id IS NOT NULL",
-            (user_id, HOUSEHOLD_USER_ID, EMBED_MODEL_NAME, EMBED_DIM),
+            (user_id, get_household_id(user_id), EMBED_MODEL_NAME, EMBED_DIM),
         ).fetchall()
     best_conv_id = None
     best_mid = None
@@ -549,7 +574,7 @@ def expand_conversation_context(query: str, user_id: str,
             "SELECT id, user_msg, assistant_msg, timestamp FROM memories "
             "WHERE conversation_id=? AND user_id IN (?, ?) AND deleted_at IS NULL AND id != ? "
             "ORDER BY id ASC LIMIT ?",
-            (best_conv_id, user_id, HOUSEHOLD_USER_ID, best_mid, max_msgs),
+            (best_conv_id, user_id, get_household_id(user_id), best_mid, max_msgs),
         ).fetchall()
     return [(r[1] or "", r[2] or "", r[3] or "") for r in conv_rows]
 
@@ -577,8 +602,9 @@ _STOP_WORDS = frozenset({
 
 def get_source_policy_map(user_id: str) -> dict:
     result = {}
-    rank = {GLOBAL_OWNER_ID: 1, HOUSEHOLD_USER_ID: 2, user_id: 3}
-    owners = (GLOBAL_OWNER_ID, HOUSEHOLD_USER_ID, user_id)
+    _hid = get_household_id(user_id)
+    rank = {GLOBAL_OWNER_ID: 1, _hid: 2, user_id: 3}
+    owners = (GLOBAL_OWNER_ID, _hid, user_id)
     with db_connect() as conn:
         rows = conn.execute(
             "SELECT owner_user_id, domain, policy FROM source_policies WHERE owner_user_id IN (?, ?, ?)",
@@ -603,7 +629,7 @@ def _keyword_fallback(query: str, user_id: str, limit: int,
         return []
     like_clauses = " OR ".join(["LOWER(content) LIKE ?" for _ in terms])
     params = [f"%{t}%" for t in terms]
-    params.extend([user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID])
+    params.extend([user_id, get_household_id(user_id), GLOBAL_OWNER_ID])
     with db_connect() as conn:
         rows = conn.execute(
             f"""SELECT id, title, content, source_domain, source_url,
@@ -653,7 +679,10 @@ def _keyword_fallback(query: str, user_id: str, limit: int,
 
 def search_knowledge(query: str, user_id: str, min_sim: float,
                      top_k: int = MAX_KNOWLEDGE_ITEMS) -> list:
+    t0 = time.time()
     q_vec = embed(query)
+    _embed_ms = (time.time() - t0) * 1000
+    t0 = time.time()
     policy_map = get_source_policy_map(user_id)
     full_detail_tags = load_full_detail_tags()
     search_dedup = _get_adaptive_search_dedup_threshold()
@@ -666,7 +695,7 @@ def search_knowledge(query: str, user_id: str, min_sim: float,
                 "FROM knowledge_items "
                 "WHERE owner_user_id IN (?, ?, ?) AND deleted_at IS NULL "
                 "AND embedding_model=? AND embedding_dim=?",
-                (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID, EMBED_MODEL_NAME, EMBED_DIM),
+                (user_id, get_household_id(user_id), GLOBAL_OWNER_ID, EMBED_MODEL_NAME, EMBED_DIM),
             ).fetchall()
         for (kid, title, content, domain, source_url, confidence, blob,
              ts, pinned, owner, tags_str, use_count) in rows:
@@ -700,10 +729,10 @@ def search_knowledge(query: str, user_id: str, min_sim: float,
                 weighted += 0.08
             elif pol == "unreliable":
                 weighted -= 0.08
-            weighted += (use_count or 0) * RECALL_BOOST_FACTOR
+            weighted += min(use_count or 0, 10) * RECALL_BOOST_FACTOR
             mem_tags = parse_tags(tags_str)
             weighted += time_decay(mem_tags, pinned, ts, full_detail_tags)
-            if sim >= min_sim or pinned:
+            if sim >= min_sim or (pinned and sim >= PINNED_MIN_SIM):
                 scored.append((weighted, sim, kid, title, content, d, conf, pol, tags_str, emb))
         scored.sort(key=lambda x: x[0], reverse=True)
     selected = []
@@ -721,7 +750,9 @@ def search_knowledge(query: str, user_id: str, min_sim: float,
         if not dup:
             selected.append(row)
     # Keyword fallback if not enough results
-    if len(selected) < top_k:
+    # v5.2: only for explicit/low-threshold searches; auto-recall must not
+    # pad the prompt with near-zero-sim keyword matches
+    if len(selected) < top_k and min_sim <= KNOWLEDGE_EXPLICIT_MIN_SIM:
         existing_ids = {row[2] for row in selected}
         needed = top_k - len(selected)
         fallback = _keyword_fallback(query, user_id, needed, existing_ids, policy_map)
@@ -738,6 +769,11 @@ def search_knowledge(query: str, user_id: str, min_sim: float,
                 conn.commit()
         except Exception as e:
             logger.warning(f"Failed to update knowledge use stats: {e}")
+    _scan_ms = (time.time() - t0) * 1000
+    _mean_sim = sum(r[1] for r in selected) / len(selected) if selected else 0.0
+    logger.info(
+        f"search_knowledge: selected={len(selected)} embed_ms={_embed_ms:.1f} "
+        f"scan_ms={_scan_ms:.1f} mean_sim={_mean_sim:.3f}")
     out = []
     for _, sim, kid, title, content, d, conf, pol, tags_str, _ in selected:
         out.append({
@@ -830,7 +866,8 @@ def format_knowledge_recall(hits: list) -> str:
     return "\n---\n".join(parts) if parts else ""
 
 def format_source_policy_summary(user_id: str) -> str:
-    owners = (user_id, HOUSEHOLD_USER_ID, GLOBAL_OWNER_ID)
+    _hid = get_household_id(user_id)
+    owners = (user_id, _hid, GLOBAL_OWNER_ID)
     with db_connect() as conn:
         rows = conn.execute(
             "SELECT owner_user_id, domain, policy FROM source_policies "
@@ -917,6 +954,8 @@ def store_memory(user_id: str, conv_id: str, user_text: str, asst_text: str,
 
 def store_pinned_memory(user_id: str, text: str, household: bool = False) -> int:
     """Store a pinned memory (manual). Returns memory ID."""
+    if household and not is_household_member(user_id):
+        raise RuntimeError("Household scope not available for this user")
     v = embed(text)
     if v is None:
         raise RuntimeError("Embedding model unavailable")
