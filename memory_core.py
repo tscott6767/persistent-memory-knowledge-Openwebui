@@ -76,9 +76,13 @@ CACHE_TTL = 60
 
 RECALL_BLOCK_MARKER = "Contextual Notes from previous discussion:"
 HOUSEHOLD_USER_ID = "household"
+# Household member UUIDs are configured via environment, e.g. in
+# docker-compose: OWUI_HOUSEHOLD_MEMBERS="uuid1,uuid2" — keeps personal
+# identifiers out of source control.
 HOUSEHOLD_MEMBER_IDS = {
-    "REMOVED-HOUSEHOLD-UUID",  # Tony
-    "REMOVED-HOUSEHOLD-UUID",  # Maria
+    m.strip()
+    for m in os.environ.get("OWUI_HOUSEHOLD_MEMBERS", "").split(",")
+    if m.strip()
 }
 
 def is_household_member(user_id: str) -> bool:

@@ -1,14 +1,14 @@
 #!/bin/bash
 # deploy_memory_core_v5.2_nodec.sh — deploy memory v5.2 patch
-# Run on NodeC (Proxmox host, REMOVED-LAN-IP) as root.
+# Run on your Proxmox host as root.
 #
-# Uses pct pull/push instead of curl-from-mcpo (mcpo :8001 does NOT serve
-# raw file paths — curl attempts return 404).
+# Uses pct pull/push to move the patch file between LXCs (no HTTP file
+# serving dependency).
 
 set -euo pipefail
 
-LXC_SRC=111   # mcp-sandbox (source of /projects files)
-LXC_DST=110   # Open WebUI
+LXC_SRC=111   # LXC hosting this repo checkout (adjust to your setup)
+LXC_DST=110   # LXC running the Open WebUI stack (adjust to your setup)
 
 echo "── Pulling patch script from LXC $LXC_SRC..."
 pct pull $LXC_SRC /projects/memory-rebuild/memory_core_v5.2_patch.py /tmp/memory_core_v5.2_patch.py
@@ -24,7 +24,7 @@ pct exec $LXC_DST -- docker restart openwebui
 
 echo
 echo "Deployed. Verify after next chat message (from LXC 110 or via pct exec):"
-echo "  pct exec 110 -- bash -c 'docker logs openwebui --tail 50 | grep search_'"
+echo "  pct exec $LXC_DST -- bash -c 'docker logs openwebui --tail 50 | grep search_'"
 echo "(expect: search_memories: selected=N embed_ms=... scan_ms=... mean_sim=...)"
 echo
 echo "If the patch printed ABORT or COMPILE FAILED, nothing was changed —"
