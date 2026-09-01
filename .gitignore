@@ -35,3 +35,4 @@ Thumbs.db
 # Exports / backups
 *.json-export*
 *.tar.gz
+pin_audit_report.txt
