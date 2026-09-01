@@ -1,8 +1,8 @@
 """
 title: Memory Tool v5
 author: household-ai
-description: Persistent memory and knowledge management — search, store, list, delete memories, knowledge items, and source policies
-version: 5.0.0
+description: Persistent memory and knowledge management — search, store (pinned or unpinned), pin/unpin, list, delete memories, knowledge items, and source policies
+version: 5.2.1
 requirements: numpy,sentence-transformers,tiktoken
 """
 
@@ -69,14 +69,20 @@ class Tools:
             lines.append(f"[mem_{hit['id']}] sim={round(hit['sim'],3)}{tag_str} — {snip}")
         return "\n---\n".join(lines)
 
-    def memory_store(self, text: str, tags: str = "", __user__: dict = None) -> str:
+    def memory_store(self, text: str, tags: str = "", pin: bool = False, __user__: dict = None) -> str:
         """
-        Store a pinned memory that should always be available for recall.
-        Use for important facts, preferences, or instructions the user wants remembered.
+        Store a memory. Default is UNPINNED — fully searchable, no ranking priority.
+        Use pin=true ONLY for critical items that must get recall priority
+        (current infrastructure state, corrections that must outrank stale
+        rivals, standing preferences/decisions, active project state).
+        Pinned items must still clear a 0.45 relevance floor (v5.2) —
+        pinning is not an always-inject. Pin sparingly.
         
         Args:
             text: The content to store as a memory.
             tags: Comma-separated tags (e.g. "technical,reference"). Optional.
+            pin: Default False (normal memory, searchable only). True = pinned
+                priority memory (ranking boost, 0.45 relevance floor).
         Returns:
             Confirmation with the new memory ID.
         """
@@ -88,8 +94,15 @@ class Tools:
         if not text:
             return "Error: No text provided to store."
         try:
-            mem_id = mc.store_pinned_memory(user_id, text)
-            return f"✅ Stored as pinned memory mem_{mem_id}. Tags: {tags or 'none'}"
+            # v5.2.1: single path via store_memory — tags + dedup now honored;
+            # the pin flag controls priority instead of always pinning.
+            mem_id = mc.store_memory(user_id, "manual", text, "",
+                                     tags=tags or None, pinned=bool(pin))
+            if mem_id is None:
+                return "⚠️ Not stored — near-duplicate of a very recent memory (dedup)."
+            if pin:
+                return f"✅ Stored as PINNED memory mem_{mem_id} (recall priority). Tags: {tags or 'none'}"
+            return f"✅ Stored as memory mem_{mem_id} (unpinned — searchable, no priority). Tags: {tags or 'none'}"
         except RuntimeError as e:
             return f"Error: {e}"
 
@@ -164,6 +177,65 @@ class Tools:
         if cur.rowcount == 0:
             return f"❌ No memory with id={mem_id} found (or not yours)."
         return f"🗑️ Forgotten memory mem_{mem_id}."
+
+    def memory_pin(self, id: str, __user__: dict = None) -> str:
+        """
+        Pin a memory so it gets recall priority (ranking boost + 0.45 relevance
+        floor instead of the 0.55 auto-recall gate). Pin sparingly — a large
+        pinned set dilutes recall quality.
+        
+        Args:
+            id: Memory ID (e.g. "mem_42" or "42").
+        Returns:
+            Confirmation of pinning.
+        """
+        mc = _ensure_core()
+        user_id = __user__.get("id") if __user__ else None
+        if not user_id:
+            return "Error: Could not identify user."
+        target = id.strip().replace("mem_", "").replace("MEM_", "").strip()
+        if not target.isdigit():
+            return f"Error: Invalid memory ID '{id}'. Use format like 'mem_42' or '42'."
+        mem_id = int(target)
+        with mc.db_connect() as conn:
+            cur = conn.execute(
+                "UPDATE memories SET pinned=1 "
+                "WHERE id=? AND user_id IN (?, ?) AND deleted_at IS NULL",
+                (mem_id, user_id, mc.HOUSEHOLD_USER_ID))
+            conn.commit()
+        if cur.rowcount == 0:
+            return f"❌ No memory with id={mem_id} found (or not yours)."
+        return f"📌 Pinned mem_{mem_id} — gets recall priority when relevant (≥0.45 floor)."
+
+    def memory_unpin(self, id: str, __user__: dict = None) -> str:
+        """
+        Remove pin priority from a memory. It remains fully searchable —
+        unpinned items surface on any query above the normal relevance gates
+        (0.55 auto-recall / 0.35 explicit search). Unpinned, unused items become
+        eligible for the 90-day prune (manual tool, never automatic).
+        
+        Args:
+            id: Memory ID (e.g. "mem_42" or "42").
+        Returns:
+            Confirmation of unpinning.
+        """
+        mc = _ensure_core()
+        user_id = __user__.get("id") if __user__ else None
+        if not user_id:
+            return "Error: Could not identify user."
+        target = id.strip().replace("mem_", "").replace("MEM_", "").strip()
+        if not target.isdigit():
+            return f"Error: Invalid memory ID '{id}'. Use format like 'mem_42' or '42'."
+        mem_id = int(target)
+        with mc.db_connect() as conn:
+            cur = conn.execute(
+                "UPDATE memories SET pinned=0 "
+                "WHERE id=? AND user_id IN (?, ?) AND deleted_at IS NULL",
+                (mem_id, user_id, mc.HOUSEHOLD_USER_ID))
+            conn.commit()
+        if cur.rowcount == 0:
+            return f"❌ No memory with id={mem_id} found (or not yours)."
+        return f"⬆️ Unpinned mem_{mem_id} — still searchable, no priority; prune-eligible if unused 90+ days."
 
     def memory_list(self, pinned_only: bool = False, __user__: dict = None) -> str:
         """
