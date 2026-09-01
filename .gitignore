@@ -36,3 +36,6 @@ Thumbs.db
 *.json-export*
 *.tar.gz
 pin_audit_report.txt
+
+# Local-only ops tooling (never publish)
+internal-tools/

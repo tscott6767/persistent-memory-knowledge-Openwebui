@@ -211,6 +211,7 @@ All configuration is via environment variables (set in OWUI container):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `OWUI_DATA_PATH` | `/app/backend/data` | Path to OWUI data directory |
+| `OWUI_HOUSEHOLD_MEMBERS` | *(empty)* | Comma-separated Open WebUI user UUIDs that share the "household" scope, e.g. `OWUI_HOUSEHOLD_MEMBERS="uuid1,uuid2"`. Users not in this list fall back to personal scope. Leave unset if you don't use household scope. |
 
 ## File Locations (inside container)
 
